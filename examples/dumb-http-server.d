@@ -1,7 +1,10 @@
-#!/bin/env dub
+#!/usr/bin/env dub
+
 /+ dub.sdl:
-    name: "dumb-http-server"
+    name "dumb_http_server"
+    dependency "unio" path=".."
 +/
+module examples.dumb_http_server;
 
 import std.stdio;
 import unio;
@@ -98,7 +101,7 @@ private:
 public:
     void close()
     {
-        // writeln("Connection closed");
+        writeln("Connection closed");
         closeSocket(sock);
     }
 }
@@ -108,14 +111,13 @@ struct Server
 private:
     IOEngine io;
     Socket sock;
-    Address addr;
+    InetAddr addr;
     Connection[maxClients] conns;
     bool running;
 
     void onConnect(IOEngine io, IO op)
     {
-        // auto inAddr = InetAddr(addr);
-        // writefln("New connection: %s:%d", inAddr, inAddr.port);
+        writefln("New connection from %s:%d", addr, addr.port);
 
         auto status = io.status(op);
 
@@ -134,17 +136,18 @@ private:
 
     void accept()
     {
-        io.submit(Accept(sock, 0, &onConnect, &addr));
+        io.submit(Accept(sock, 0, &onConnect, &addr.val));
     }
 
 public:
-    this(IOEngine engine, Address addr) @trusted
+    this(IOEngine engine, InetAddr addr) @trusted
     {
         import core.sys.posix.netinet.in_;
         import core.sys.posix.sys.socket;
         import core.sys.linux.netinet.tcp;
 
         io = engine;
+        this.addr = addr;
 
         int flags = 1;
         auto fd = socket(AF_INET, SOCK_STREAM | 0x800, IPPROTO_TCP);
@@ -153,7 +156,7 @@ public:
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flags, int.sizeof);
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, int.sizeof);
 
-        bind(fd, &addr.val, addr.sizeof);
+        bind(fd, &addr.val.val, addr.sizeof);
         listen(fd, backlog);
         sock = Socket(fd);
     }
@@ -170,6 +173,8 @@ public:
 
     void run()
     {
+        writefln("Server started at http://%s:%d", addr, addr.port);
+
         accept();
 
         running = true;
