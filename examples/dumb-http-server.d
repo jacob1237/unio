@@ -14,7 +14,7 @@ enum backlog = 512;
 
 void[maxMsgLen] buf;
 
-static immutable void[] response = cast(immutable void[]) (
+static response = cast(immutable void[]) (
     "HTTP/1.1 200 OK\r\n"
     ~ "Server: unio\r\n"
     ~ "Connection: keep-alive\r\n"
@@ -24,7 +24,7 @@ static immutable void[] response = cast(immutable void[]) (
     ~ "Hello, World!"
 );
 
-static immutable void[] error404 = cast(immutable void[]) (
+static error404 = cast(immutable void[]) (
     "HTTP/1.1 404 Not Found\r\n"
     ~ "Server: unio\r\n"
     ~ "Connection: keep-alive\r\n"
@@ -43,8 +43,8 @@ private:
 
     void handleRequest(IOEngine io, size_t len) @trusted
     {
-        static immutable sep = "\r\n\r\n";
-        static string favicon = "GET /favicon";
+        static sep = "\r\n\r\n";
+        static favicon = "GET /favicon";
 
         if (len < 4) {
             return;
