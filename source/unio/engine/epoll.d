@@ -1,14 +1,12 @@
 module unio.engine.epoll;
 
-@safe @nogc:
+@safe:// @nogc:
 
 public import unio.engine;
 
 private:
-    import std.stdio;
-
     import core.sys.posix.netinet.in_;
-    import unio.primitives.pool : FreeList, Key;
+    import unio.primitives;
 
     enum SOCK_NONBLOCK = 0x800;
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
@@ -30,22 +28,40 @@ private:
     }
 
     /** 
+     * The pipeline represents a chain of tasks to be executed
+     */
+    struct Pipeline
+    {
+        enum State : ubyte { ready, notReady, error, hup }
+
+        State state;
+        Key head; // First task in the queue
+        Key tail; // Last task in the queue
+
+        @property
+        {
+            bool ready()
+            {
+                return state == State.ready;
+            }
+
+            bool error()
+            {
+                return state == State.error;
+            }
+        }
+    }
+
+    /** 
      * File descriptor state
      */
     struct FDInfo
     {
-        struct State
-        {
-            bool ready;
-            Key head; // First task in the queue
-            Key tail; // Last task in the queue
-        }
-
         int fd;
-        State read;
-        State write;
+        Pipeline read;
+        Pipeline write;
 
-        State getState(const ref Task t)
+        Pipeline getPipeline(const ref Task t)
         {
             return t.isWrite ? this.write : this.read;
         }
@@ -53,13 +69,13 @@ private:
         /** 
          * Return state struct depending on the passed task type
          */
-        void setState(const ref Task t, const State newState)
+        void setPipeline(const ref Task t, const Pipeline newPipeline)
         {
             if (t.isWrite) {
-                write = newState;
+                write = newPipeline;
             }
             else {
-                read = newState;
+                read = newPipeline;
             }
         }
     }
@@ -79,7 +95,6 @@ private:
         OpType type;
         Status.Type status;
         Data data;
-        size_t prev;
         size_t next;
         long result;
 
@@ -99,7 +114,7 @@ private:
     }
 
     /** 
-     * Convert operation data to a squeue entry
+     * Convert operation data to a Task entry
      */
     Task toTask(Op)(Op op) @trusted
     {
@@ -126,26 +141,44 @@ private:
         return entry;
     }
 
+    // TODO: Handle getsockopt() error as well as the fd type
+    int lastSocketError(int fd) @trusted
+    {
+        int err;
+        socklen_t len = err.sizeof;
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+
+        return err;
+    }
+
 public:
     /** 
      * Epoll IO engine implementation
      *
      * TODO: Add support for the `Wait` operation
+     * TODO: Distinguish different types of file descriptors
+     * TODO: Add operation chaining
+     * TODO: Add support for timers
+     * TODO: Add support for async file operations (via AIO/io_submit or a dedicated thread pool)
      * TODO: Handle connection errors both for read/write operations
      * TODO: Rename read/write task types to input/output
      * TODO: Make task containers more flexible and efficient
      * TODO: Edge case: epoll may notify readiness for send(), but EAGAIN will be returned: https://habr.com/ru/post/416669/#comment_18865881
+     * TODO: Add unit tests
+     * TODO: Handle SIGPIPE correctly when using `write()`: https://stackoverflow.com/a/18963142/7695184
+     * TODO: Handle setsockopt() `SO_RCVTIMEO` and `SO_SNDTIMEO` (check how do they react)
+     * TODO: Call epoll_ctl(EPOLL_CTL_DEL) when there are no tasks for a file descriptor for a long time
      */
     class EpollEngine : IOEngine
     {
-        import core.stdc.errno : errno, EAGAIN, EINPROGRESS, EWOULDBLOCK, ECONNRESET;
+        import core.stdc.errno;
         import core.sys.linux.epoll;
+        import core.sys.posix.arpa.inet;
+        import core.sys.posix.unistd;
         import core.sys.posix.sys.socket;
-        import core.sys.posix.unistd : closefd = close;
         import core.time : Duration, msecs;
+
         import std.experimental.allocator.mallocator : Mallocator;
-        import unio.primitives.fdset : FDSet;
-        import unio.primitives.queue : RingBuffer;
 
         enum maxEvents = 256;
         enum queueSize = 1024;
@@ -173,123 +206,141 @@ public:
 
         /** 
          * Finish the task and set its result
-         * Updates descriptor state for the next task
+         * Updates pipeline state for the next task
          */
-        void completeTask(
-            ref FDInfo fdi,
-            const Key taskId,
-            ref Task task,
-            const Status.Type status,
-            const long result
-        ) @trusted {
-            auto state = fdi.getState(task);
+        void completeTask(ref Pipeline pipeline, const Key taskId, ref Task task, long ret)
+        {
+            const status = ret < 0 ? Status.Type.Error : Status.Type.Success;
+            const result = ret < 0 ? errno() : ret;
 
-            // Skip the blocking task until new fd readiness event arrives
-            if (status == Status.type.Error &&
-                (result == EINPROGRESS || result == EAGAIN || result == EWOULDBLOCK)
-            ) {
-                task.result = result;
-
-                state.ready = false;
-                fdi.setState(task, state);
+            // Postpone the blocking task completion until new fd event arrives
+            if (result == EINPROGRESS || result == EAGAIN || result == EWOULDBLOCK) {
+                pipeline.state = Pipeline.State.notReady;
                 return;
             }
 
             task.status = status;
             task.result = result;
 
-            with (task)
+            if (!task.next)
             {
-                if (!next) {
-                    state.head = 0;
-                    state.tail = 0;
-                }
-                else
-                {
-                    state.head = next;
+                pipeline.head = 0;
+                pipeline.tail = 0;
+            }
+            else
+            {
+                pipeline.head = task.next;
 
-                    // If the readiness state didn't change, we add the next task
-                    // to the running queue immediately
-                    if (state.ready || task.isWrite) {
-                        rqueue.put(state.head);
-                    }
+                // If the readiness pipeline didn't change, we add the next task
+                // to the running queue immediately
+                if (pipeline.ready || task.isWrite) {
+                    rqueue.put(pipeline.head);
                 }
+            }
 
-                fdi.setState(task, state);
+            if (task.data.cb !is null) {
+                task.data.cb(this, IO(taskId));
+            }
+        }
 
-                if (data.cb != data.cb.init) {
-                    data.cb(this, IO(taskId));
-                }
+        auto dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
+        {
+            socklen_t addrLen;
+            return accept4(fdi.fd, task.newAddr, &addrLen, SOCK_NONBLOCK);
+        }
+
+        /** 
+         * Perform socket connection
+         *
+         * Because connect() may return `EINPROGRESS` on the first run, the funcion will
+         * postpone task completion until the next run (or EPOLLERR)
+         */
+        auto dispatchConnect(ref FDInfo fdi, ref Task task) @trusted
+        {
+            switch (fdi.write.state)
+            {
+                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
+                case Pipeline.State.ready: return 0;
+                default: return connect(fdi.fd, &task.addr, task.addr.sizeof);
             }
         }
 
         /** 
-         * Run specific task from the queue
+         * TODO: handle EOF (or peer shutdown)
+         */
+        auto dispatchRead(ref FDInfo fdi, ref Task task) @trusted
+        {
+            const ret = read(fdi.fd, task.buf.ptr, cast(int) task.buf.length);
+            if (ret == 0) fdi.read.state = Pipeline.State.hup;
+
+            return ret;
+        }
+
+        auto dispatchWrite(ref FDInfo fdi, ref Task task) @trusted
+        {
+            return write(fdi.fd, task.buf.ptr, cast(int) task.buf.length);
+        }
+
+        auto dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
+        {
+            return recv(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags);
+        }
+
+        auto dispatchSend(ref FDInfo fdi, ref Task task) @trusted
+        {
+            return send(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags | MSG_NOSIGNAL);
+        }
+
+        /** 
+         * Execute all pending tasks from the run queue
          *
          * TODO: Get rid of switch-case here to achieve cache-friendliness
          * TODO: Hadle partial reads and writes (when the descriptor is not ready)
          */
-        void runTask(ref FDInfo fdi, const Key taskId, ref Task task) @trusted
+        void runTasks()
         {
-            import core.sys.posix.unistd : read, write;
-            import core.sys.posix.arpa.inet : send, recv, accept, connect;
-
-            long ret;
-
-            with (task)
+            for (auto taskId = rqueue.front; !rqueue.empty; rqueue.popFront())
             {
-                auto fd = data.fd;
+                auto task = tasks.get(taskId);
 
-                final switch (type)
+                if (task.isNull) {
+                    continue;
+                }
+
+                if (auto fdi = task.data.fd in fds)
                 {
-                    case OpType.Accept:
-                        socklen_t addrLen;
-                        ret = accept4(fd, newAddr, &addrLen, SOCK_NONBLOCK);
-                        break;
+                    auto pipeline = task.isWrite ? fdi.write : fdi.read;
 
-                    case OpType.Connect:
-                        // Complete a half-processed connect() if the last retry failed
-                        if (result > 0)
-                        {
-                            result = result != EINPROGRESS ? result : 0;
-                            status = result ? Status.Type.Error : Status.Type.Success;
+                    // Just a hack for now
+                    // TODO: Handle EPOLLRDHUP correctly
+                    if (pipeline.state == Pipeline.State.hup && task.isWrite) {
+                        completeTask(pipeline, taskId, task, EPIPE);
+                        continue;
+                    }
 
-                            completeTask(fdi, taskId, task, status, result);
-                            return;
-                        }
+                    long ret;
 
-                        ret = connect(fd, &addr, addr.sizeof);
-                        break;
+                    final switch (task.type)
+                    {
+                        case OpType.Accept: ret = dispatchAccept(*fdi, task); break;
+                        case OpType.Connect: ret = dispatchConnect(*fdi, task); break;
+                        case OpType.Read: ret = dispatchRead(*fdi, task); break;
+                        case OpType.Write: ret = dispatchWrite(*fdi, task); break;
+                        case OpType.Receive: ret = dispatchRecv(*fdi, task); break;
+                        case OpType.Send: ret = dispatchSend(*fdi, task); break;
+                    }
 
-                    case OpType.Read:
-                        ret = read(fd, buf.ptr, cast(int) buf.length);
-                        break;
-
-                    case OpType.Write:
-                        ret = write(fd, buf.ptr, cast(int) buf.length);
-                        break;
-
-                    case OpType.Receive:
-                        ret = recv(fd, buf.ptr, cast(int) buf.length, flags);
-                        break;
-
-                    case OpType.Send:
-                        ret = send(fd, buf.ptr, cast(int) buf.length, flags | MSG_NOSIGNAL);
-                        break;
+                    completeTask(pipeline, taskId, task, ret);
                 }
             }
-
-            auto status = ret < 0 ? Status.Type.Error : Status.Type.Success;
-            auto result = ret < 0 ? errno() : ret;
-
-            completeTask(fdi, taskId, task, status, result);
         }
 
         /** 
-         * Prepare a submitted task for execution
+         * Submit the task to the execution pipeline
          */
-        void processSubmissionEntry(const Key taskId, ref Task task) @trusted
+        IO submitTask(const Key taskId) @trusted
         {
+            auto task = tasks.get(taskId);
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
@@ -301,67 +352,48 @@ public:
                 };
 
                 epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
-
-                return FDInfo(fd, FDInfo.State(false), FDInfo.State(true));
+                return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.ready));
             }());
 
             /*
-             * When we already have the fd state in our list, we just need to update
+             * When we already have the FDInfo in our list, we just need to update
              * pointers for the associated tasks, but we must consider two scenarios:
              *
              * 1. There are no associated tasks for this descriptor
              * 2. There are already some scheduled tasks
              */
-            auto state = fdi.getState(task);
+            auto pipeline = fdi.getPipeline(task);
 
-            if (!state.head)
+            if (!pipeline.head)
             {
-                state.head = taskId;
-                state.tail = taskId;
+                pipeline.head = taskId;
+                pipeline.tail = taskId;
 
                 // Immediately put the task to the run queue because the file
                 // descriptor is ready to perform reads or writes
-                if (state.ready || task.isWrite) {
+                if (pipeline.state == Pipeline.State.ready || task.isWrite) {
                     rqueue.put(taskId);
                 }
             }
             else
             {
-                auto lastTask = tasks.get(state.tail);
+                auto lastTask = tasks.get(pipeline.tail);
 
                 if (!lastTask.isNull) {
                     lastTask.next = taskId;
-                    task.prev = state.tail;
-                    state.tail = taskId;
+                    pipeline.tail = taskId;
                 }
             }
 
-            fdi.setState(task, state);
-        }
+            fdi.setPipeline(task, pipeline);
 
-        /** 
-         * Handle all newly added tasks from the user submission queue
-         */
-        void processSubmissionQueue()
-        {
-            while (!squeue.empty)
-            {
-                const taskId = squeue.front;
-                auto task = tasks.get(taskId);
-
-                // Skip cancelled tasks
-                if (!task.isNull) {
-                    processSubmissionEntry(taskId, task);
-                }
-
-                squeue.popFront();
-            }
+            return IO(taskId);
         }
 
         /** 
          * Process events coming from the epoll socket
          */
-        void processEpollEvents() @trusted
+        void processEvents() @trusted
         {
             auto ret = epoll_wait(epoll, events.ptr, cast(int) events.length, -1);
 
@@ -370,7 +402,6 @@ public:
                 return;
             }
 
-            // Schedule tasks associated with epoll events for execution
             foreach (ref ev; events[0 .. ret])
             {
                 const fd = ev.data.fd;
@@ -382,87 +413,29 @@ public:
                     continue;
                 }
 
-                if (ev.events & EPOLLRDHUP || ev.events & EPOLLHUP)
-                {
-                    auto readTask = tasks.get(fdi.read.head);
-                    auto writeTask = tasks.get(fdi.write.head);
-
-                    if (!readTask.isNull) {
-                        completeTask(*fdi, fdi.read.head, readTask, Status.Type.Error, ECONNRESET);
-                    }
-
-                    if (!writeTask.isNull) {
-                        completeTask(*fdi, fdi.write.head, writeTask, Status.Type.Error, ECONNRESET);
-                    }
-
-                    epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
-                    fds.remove(fd);
-
-                    continue;
-                }
-
+                // BUG: Prevent scheduling the same task multiple times when receiving events for the same descriptor
                 if (ev.events & EPOLLIN)
                 {
-                    fdi.read.ready = true;
+                    fdi.read.state =
+                        ev.events & EPOLLERR ? Pipeline.State.error :
+                        ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                    if (fdi.read.head) {
-                        rqueue.put(fdi.read.head);
-                    }
+                    if (tasks.has(fdi.read.head)) rqueue.put(fdi.read.head);
                 }
 
                 // TODO: Handle partially-completed write operations (and retries in case of EINTR)
-                // TODO: Handle EPOLLRDHUP and EPOLLHUP
                 if (ev.events & EPOLLOUT)
                 {
-                    fdi.write.ready = true;
+                    fdi.write.state =
+                        ev.events & EPOLLERR ? Pipeline.State.error :
+                        ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                    auto taskId = fdi.write.head;
-                    auto task = tasks.get(taskId);
-
-                    if (!task.isNull)
-                    {
-                        // TODO: Handle getsockopt() error as well as the fd type
-                        if (ev.events & EPOLLERR)
-                        {
-                            int err;
-                            socklen_t len = err.sizeof;
-                            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-
-                            task.result = err;
-                        }
-
-                        rqueue.put(taskId);
-                    }
+                    if (tasks.has(fdi.write.head)) rqueue.put(fdi.write.head);
                 }
-            }
-        }
-
-        /** 
-         * Execute all pending tasks from the run queue
-         */
-        void runTasks() @trusted
-        {
-            while (!rqueue.empty)
-            {
-                auto taskId = rqueue.front;
-                auto task = tasks.get(taskId);
-
-                if (!task.isNull)
-                {
-                    auto fdi = task.data.fd in fds;
-
-                    if (fdi) {
-                        runTask(*fdi, taskId, task);
-                    }
-                }
-
-                rqueue.popFront();
             }
         }
 
     public:
-        alias List(Elem...) = Elem;
-
         this(size_t minCapacity = initialCapacity) @trusted
         {
             epoll = epoll_create1(0);
@@ -474,17 +447,17 @@ public:
          */
         ~this() @trusted
         {
-            closefd(epoll);
+            close(epoll);
         }
+
+        alias List(Elem...) = Elem;
 
         static foreach (T; List!(Connect, Accept, Receive, Send, Read, Write))
         {
             IO submit(T op)
             {
-                auto entry = tasks.add(toTask(op));
-                squeue.put(entry);
-
-                return IO(entry);
+                auto taskId = tasks.add(toTask(op));
+                return submitTask(taskId);
             }
         }
 
@@ -528,15 +501,29 @@ public:
                 return 0;
             }
 
-            processSubmissionQueue();
             runTasks();
-
-            processSubmissionQueue();
-            runTasks();
-
-            processEpollEvents();
+            processEvents();
             runTasks();
 
             return tasks.length || squeue.length;
         }
     }
+
+// @trusted unittest
+// {
+//     import std.stdio : stdout, writeln;
+//     import std.functional : toDelegate;
+
+//     void cb(IOEngine engine, IO op) {
+//         auto status = engine.status(op);
+//         writeln(status.result);
+//     }
+
+//     ubyte[4] buf;
+//     auto engine = new EpollEngine();
+//     auto fd = File(stdout.fileno);
+
+//     engine.submit(Read(fd, 0, &cb, buf));
+//     immutable count = engine.process();
+//     assert(count == 0);
+// }
