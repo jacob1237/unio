@@ -40,15 +40,8 @@ private:
 
         @property
         {
-            bool ready()
-            {
-                return state == State.ready;
-            }
-
-            bool error()
-            {
-                return state == State.error;
-            }
+            bool ready() { return state == State.ready; }
+            bool error() { return state == State.error; }
         }
     }
 
@@ -61,23 +54,7 @@ private:
         Pipeline read;
         Pipeline write;
 
-        Pipeline getPipeline(const ref Task t)
-        {
-            return t.isWrite ? this.write : this.read;
-        }
-
-        /** 
-         * Return state struct depending on the passed task type
-         */
-        void setPipeline(const ref Task t, const Pipeline newPipeline)
-        {
-            if (t.isWrite) {
-                write = newPipeline;
-            }
-            else {
-                read = newPipeline;
-            }
-        }
+        ref Pipeline pipeline(ref Task t) return { return t.isWrite ? write : read; }
     }
 
     /** 
@@ -198,11 +175,8 @@ public:
         FDSet!FDInfo fds;
         FreeList!(Task, Mallocator) tasks;
 
-        // Submission queue
-        RingBuffer!(Key, queueSize) squeue;
-
         // Run queue
-        RingBuffer!(Key, queueSize) rqueue;
+        RingBuffer!(Key, queueSize) runQueue;
 
         /** 
          * Finish the task and set its result
@@ -234,7 +208,7 @@ public:
                 // If the readiness pipeline didn't change, we add the next task
                 // to the running queue immediately
                 if (pipeline.ready || task.isWrite) {
-                    rqueue.put(pipeline.head);
+                    runQueue.put(pipeline.head);
                 }
             }
 
@@ -288,7 +262,11 @@ public:
 
         auto dispatchSend(ref FDInfo fdi, ref Task task) @trusted
         {
-            return send(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags | MSG_NOSIGNAL);
+            switch (fdi.write.state)
+            {
+                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
+                default: return send(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags | MSG_NOSIGNAL);
+            }
         }
 
         /** 
@@ -296,11 +274,13 @@ public:
          *
          * TODO: Get rid of switch-case here to achieve cache-friendliness
          * TODO: Hadle partial reads and writes (when the descriptor is not ready)
+         * TODO: Reset pipeline state after errors and HUP (to allow submit new operations)
          */
-        void runTasks()
+        void runTasks() @trusted
         {
-            for (auto taskId = rqueue.front; !rqueue.empty; rqueue.popFront())
+            for (; !runQueue.empty; runQueue.popFront())
             {
+                auto taskId = runQueue.front;
                 auto task = tasks.get(taskId);
 
                 if (task.isNull) {
@@ -309,7 +289,7 @@ public:
 
                 if (auto fdi = task.data.fd in fds)
                 {
-                    auto pipeline = task.isWrite ? fdi.write : fdi.read;
+                    auto pipeline = fdi.pipeline(task);
 
                     // Just a hack for now
                     // TODO: Handle EPOLLRDHUP correctly
@@ -338,21 +318,17 @@ public:
         /** 
          * Submit the task to the execution pipeline
          */
-        IO submitTask(const Key taskId) @trusted
+        IO scheduleTask(const Key taskId) @trusted
         {
             auto task = tasks.get(taskId);
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
-            auto fdi = &fds.require(fd,
-            {
-                epoll_event ev = {
-                    events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP,
-                    data: { fd: fd }
-                };
-
+            auto fdi = &fds.require(fd, {
+                epoll_event ev = { events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP, data: { fd: fd }};
                 epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
-                return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.ready));
+
+                return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.notReady));
             }());
 
             /*
@@ -362,30 +338,29 @@ public:
              * 1. There are no associated tasks for this descriptor
              * 2. There are already some scheduled tasks
              */
-            auto pipeline = fdi.getPipeline(task);
-
-            if (!pipeline.head)
+            with (fdi.pipeline(task))
             {
-                pipeline.head = taskId;
-                pipeline.tail = taskId;
+                if (!head)
+                {
+                    head = taskId;
+                    tail = taskId;
 
-                // Immediately put the task to the run queue because the file
-                // descriptor is ready to perform reads or writes
-                if (pipeline.state == Pipeline.State.ready || task.isWrite) {
-                    rqueue.put(taskId);
+                    // Immediately put the task to the run queue because the file
+                    // descriptor is ready to perform reads or writes
+                    if (state == Pipeline.State.ready || task.isWrite) {
+                        runQueue.put(taskId);
+                    }
+                }
+                else
+                {
+                    auto lastTask = tasks.get(tail);
+
+                    if (!lastTask.isNull) {
+                        lastTask.next = taskId;
+                        tail = taskId;
+                    }
                 }
             }
-            else
-            {
-                auto lastTask = tasks.get(pipeline.tail);
-
-                if (!lastTask.isNull) {
-                    lastTask.next = taskId;
-                    pipeline.tail = taskId;
-                }
-            }
-
-            fdi.setPipeline(task, pipeline);
 
             return IO(taskId);
         }
@@ -407,20 +382,19 @@ public:
                 const fd = ev.data.fd;
                 auto fdi = fd in fds;
 
-                // Remove file descriptors whose state isn't tracked by the engine
                 if (!fdi) {
                     epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
                     continue;
                 }
 
-                // BUG: Prevent scheduling the same task multiple times when receiving events for the same descriptor
+                // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
                 if (ev.events & EPOLLIN)
                 {
                     fdi.read.state =
                         ev.events & EPOLLERR ? Pipeline.State.error :
                         ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                    if (tasks.has(fdi.read.head)) rqueue.put(fdi.read.head);
+                    if (tasks.has(fdi.read.head)) runQueue.put(fdi.read.head);
                 }
 
                 // TODO: Handle partially-completed write operations (and retries in case of EINTR)
@@ -430,7 +404,7 @@ public:
                         ev.events & EPOLLERR ? Pipeline.State.error :
                         ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                    if (tasks.has(fdi.write.head)) rqueue.put(fdi.write.head);
+                    if (tasks.has(fdi.write.head)) runQueue.put(fdi.write.head);
                 }
             }
         }
@@ -457,7 +431,7 @@ public:
             IO submit(T op)
             {
                 auto taskId = tasks.add(toTask(op));
-                return submitTask(taskId);
+                return scheduleTask(taskId);
             }
         }
 
@@ -505,25 +479,60 @@ public:
             processEvents();
             runTasks();
 
-            return tasks.length || squeue.length;
+            return tasks.length;
         }
     }
 
-// @trusted unittest
-// {
-//     import std.stdio : stdout, writeln;
-//     import std.functional : toDelegate;
+/**
+ * NOTE: To make the code inherently safe, the read/write buffers, socket addresses and
+ *       other data must not be passed as pointers. To achieve this, we should either pass
+ *       a callback or some struct/class that will provide the pointer (requires testing)
+ */
+@("fdStdRead")
+unittest
+{
+    import std.stdio : stdout;
 
-//     void cb(IOEngine engine, IO op) {
-//         auto status = engine.status(op);
-//         writeln(status.result);
-//     }
+    void cb(IOEngine io, IO op) { io.status(op); }
 
-//     ubyte[4] buf;
-//     auto engine = new EpollEngine();
-//     auto fd = File(stdout.fileno);
+    ubyte[4] buf;
+    auto io = new EpollEngine();
+    auto fd = (() @trusted => File(stdout.fileno))();
 
-//     engine.submit(Read(fd, 0, &cb, buf));
-//     immutable count = engine.process();
-//     assert(count == 0);
-// }
+    io.submit(Read(fd, 0, &cb, buf));
+    assert(1 == io.process(), "Read operation must be blocking");
+}
+
+@("sockConnectAccept")
+@trusted unittest
+{
+    import std.stdio;
+    import core.stdc.errno;
+
+    static bool accepted;
+    void serverCb(IOEngine io, IO op) { accepted = true; io.status(op); }
+
+    static bool connected;
+    void clientCb(IOEngine io, IO op) { connected = true; io.status(op); }
+
+    // Server
+    const server = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    const serverAddr = InetAddr("127.0.0.1", 6767);
+
+    int flags = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &flags, int.sizeof);
+    bind(server, cast(sockaddr*) &serverAddr, serverAddr.sizeof);
+    listen(server, 10);
+
+    // Client
+    const client = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    auto clientAddr = InetAddr();
+
+    auto io = new EpollEngine();
+    io.submit(Accept(server, 0, &serverCb, &clientAddr.val));
+    io.submit(Connect(client, 0, &clientCb, serverAddr));
+    io.process();
+
+    assert(connected);
+    assert(accepted);
+}
