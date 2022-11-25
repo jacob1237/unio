@@ -40,30 +40,11 @@ private:
 public:
     @property
     {
-        bool empty() const
-        {
-            return tail == head;
-        }
-
-        bool full() const
-        {
-            return next(tail) == head;
-        }
-
-        E front() const
-        {
-            return data[head];
-        }
-
-        size_t capacity() const
-        {
-            return Size;
-        }
-
-        size_t length() const
-        {
-            return tail - head;
-        }
+        bool empty() const { return tail == head; }
+        bool full() const { return next(tail) == head; }
+        E front() const { return data[head]; }
+        size_t capacity() const { return Size; }
+        size_t length() const { return tail - head; }
     }
 
     /** 
