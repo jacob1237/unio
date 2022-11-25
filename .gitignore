@@ -1,3 +1,4 @@
 .dub
 libunio.a
+*-test-*
 .vscode
