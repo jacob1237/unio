@@ -5,7 +5,9 @@ module unio.engine.epoll;
 public import unio.engine;
 
 private:
+    import core.stdc.errno;
     import core.sys.posix.netinet.in_;
+    import core.sys.posix.unistd;
     import unio.primitives;
 
     enum SOCK_NONBLOCK = 0x800;
@@ -40,7 +42,7 @@ private:
 
         @property
         {
-            bool ready() { return state == State.ready; }
+            bool ready() { return state != State.notReady; }
             bool error() { return state == State.error; }
         }
     }
@@ -101,19 +103,10 @@ private:
             Task.Data(cast(size_t) op.fd, op.key, op.cb)
         );
 
-        static if (__traits(hasMember, Op, "buf")) {
-            entry.buf = op.buf;
-        }
-        else static if (__traits(hasMember, Op, "addr")) {
-            entry.addr = op.addr;
-        }
-        else static if (__traits(hasMember, Op, "newAddr")) {
-            entry.newAddr = cast(sockaddr*) op.newAddr;
-        }
-
-        static if (__traits(hasMember, Op, "flags")) {
-            entry.flags = op.flags;
-        }
+        static if (__traits(hasMember, Op, "buf")) entry.buf = op.buf;
+        static if (__traits(hasMember, Op, "addr")) entry.addr = op.addr;
+        static if (__traits(hasMember, Op, "newAddr")) entry.newAddr = cast(sockaddr*) op.newAddr;
+        static if (__traits(hasMember, Op, "flags")) entry.flags = op.flags;
 
         return entry;
     }
@@ -132,6 +125,7 @@ public:
     /** 
      * Epoll IO engine implementation
      *
+     * TODO: Get rid of callbacks in favor of completion queue
      * TODO: Add support for the `Wait` operation
      * TODO: Distinguish different types of file descriptors
      * TODO: Add operation chaining
@@ -141,17 +135,15 @@ public:
      * TODO: Rename read/write task types to input/output
      * TODO: Make task containers more flexible and efficient
      * TODO: Edge case: epoll may notify readiness for send(), but EAGAIN will be returned: https://habr.com/ru/post/416669/#comment_18865881
-     * TODO: Add unit tests
      * TODO: Handle SIGPIPE correctly when using `write()`: https://stackoverflow.com/a/18963142/7695184
      * TODO: Handle setsockopt() `SO_RCVTIMEO` and `SO_SNDTIMEO` (check how do they react)
      * TODO: Call epoll_ctl(EPOLL_CTL_DEL) when there are no tasks for a file descriptor for a long time
+     * TODO: Handle vectorized I/O (iovec)
      */
     class EpollEngine : IOEngine
     {
-        import core.stdc.errno;
         import core.sys.linux.epoll;
         import core.sys.posix.arpa.inet;
-        import core.sys.posix.unistd;
         import core.sys.posix.sys.socket;
         import core.time : Duration, msecs;
 
@@ -205,7 +197,7 @@ public:
             {
                 pipeline.head = task.next;
 
-                // If the readiness pipeline didn't change, we add the next task
+                // If the pipeline readiness didn't change, we add the next task
                 // to the running queue immediately
                 if (pipeline.ready || task.isWrite) {
                     runQueue.put(pipeline.head);
@@ -244,7 +236,19 @@ public:
          */
         auto dispatchRead(ref FDInfo fdi, ref Task task) @trusted
         {
-            const ret = read(fdi.fd, task.buf.ptr, cast(int) task.buf.length);
+            if (fdi.read.state == Pipeline.State.hup) return 0;
+
+            const ret = read(fdi.fd, task.buf.ptr, task.buf.length);
+            if (ret == 0) fdi.read.state = Pipeline.State.hup;
+
+            return ret;
+        }
+
+        auto dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
+        {
+            if (fdi.read.state == Pipeline.State.hup) return 0;
+
+            const ret = recv(fdi.fd, task.buf.ptr, task.buf.length, task.flags);
             if (ret == 0) fdi.read.state = Pipeline.State.hup;
 
             return ret;
@@ -252,12 +256,7 @@ public:
 
         auto dispatchWrite(ref FDInfo fdi, ref Task task) @trusted
         {
-            return write(fdi.fd, task.buf.ptr, cast(int) task.buf.length);
-        }
-
-        auto dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
-        {
-            return recv(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags);
+            return write(fdi.fd, task.buf.ptr, task.buf.length);
         }
 
         auto dispatchSend(ref FDInfo fdi, ref Task task) @trusted
@@ -483,6 +482,37 @@ public:
         }
     }
 
+version(unittest)
+{
+    Socket makeServerSocket(InetAddr addr) @trusted
+    {
+        const fd = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        int flags = 1;
+
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flags, flags.sizeof);
+        bind(fd, cast(sockaddr*) &addr, addr.sizeof);
+        listen(fd, 10);
+
+        return fd;
+    }
+
+    Socket[2] makeSocketPair(InetAddr serverAddr) @trusted
+    {
+        const listener = makeServerSocket(serverAddr);
+        const client = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+
+        connect(client, cast(sockaddr*) &serverAddr, serverAddr.sizeof);
+
+        auto clientAddr = InetAddr();
+        socklen_t addrLen;
+        auto server = accept(listener, cast(sockaddr*) &clientAddr, &addrLen);
+
+        assert(server > 0);
+
+        return [client, Socket(server)];
+    }
+}
+
 /**
  * NOTE: To make the code inherently safe, the read/write buffers, socket addresses and
  *       other data must not be passed as pointers. To achieve this, we should either pass
@@ -496,43 +526,241 @@ unittest
     void cb(IOEngine io, IO op) { io.status(op); }
 
     ubyte[4] buf;
-    auto io = new EpollEngine();
     auto fd = (() @trusted => File(stdout.fileno))();
 
-    io.submit(Read(fd, 0, &cb, buf));
-    assert(1 == io.process(), "Read operation must be blocking");
+    with (new EpollEngine()) {
+        submit(Read(fd, 0, &cb, buf));
+        assert(1 == process(), "Read operation must be blocking");
+    }
 }
 
 @("sockConnectAccept")
 @trusted unittest
 {
-    import std.stdio;
-    import core.stdc.errno;
-
     static bool accepted;
-    void serverCb(IOEngine io, IO op) { accepted = true; io.status(op); }
+    void serverCb(IOEngine io, IO op) { accepted = true; assert(io.status(op).result > 0);}
 
     static bool connected;
     void clientCb(IOEngine io, IO op) { connected = true; io.status(op); }
 
     // Server
-    const server = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
-    const serverAddr = InetAddr("127.0.0.1", 6767);
-
-    int flags = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &flags, int.sizeof);
-    bind(server, cast(sockaddr*) &serverAddr, serverAddr.sizeof);
-    listen(server, 10);
+    const serverAddr = InetAddr("127.0.0.1", 6760);
+    const server = makeServerSocket(serverAddr);
 
     // Client
-    const client = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
     auto clientAddr = InetAddr();
+    const client = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
 
-    auto io = new EpollEngine();
-    io.submit(Accept(server, 0, &serverCb, &clientAddr.val));
-    io.submit(Connect(client, 0, &clientCb, serverAddr));
-    io.process();
+    scope(exit) {
+        close(client);
+        close(server);
+    }
+
+    with (new EpollEngine()) {
+        submit(Accept(server, 0, &serverCb, &clientAddr.val));
+        submit(Connect(client, 0, &clientCb, serverAddr));
+        process();
+    }
 
     assert(connected);
     assert(accepted);
 }
+
+@("sockWriteSuccess")
+@trusted unittest
+{
+    import std.stdio;
+
+    Socket[2] sockets;
+    assert(0 == socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, cast(int[2]) sockets));
+    scope(exit) {
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    const client = sockets[0];
+    const server = sockets[1];
+
+    static completed = false;
+    static msg = cast(void[]) "Hello, world";
+
+    void cb(IOEngine io, IO op)
+    {
+        completed = true;
+        assert(io.status(op).result == msg.length);
+    }
+
+    with (new EpollEngine()) {
+        submit(Write(client, 0, &cb, msg));
+        process();
+    }
+
+    assert(completed);
+
+    // Check data on the other end of the socket
+    ubyte[100] buf;
+    assert(msg.length == recv(server, &buf, buf.length, 0));
+}
+
+@("sockSendFail")
+@trusted unittest
+{
+    static completed = false;
+
+    void cb(IOEngine io, IO op)
+    {
+        completed = true;
+
+        with (io.status(op)) {
+            assert(failed);
+            assert(result == EPIPE);
+        }
+    }
+
+    const fd = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
+    scope(exit) close(fd);
+
+    with (new EpollEngine()) {
+        submit(Send(fd, 0, &cb, cast(void[]) "Test"));
+        process();
+    }
+
+    assert(completed);
+}
+
+@("sockSendHup")
+@trusted unittest
+{
+    static msg = cast(immutable void[]) "Test1";
+
+    static completed = 0;
+    void cb(IOEngine io, IO op)
+    {
+        completed++;
+
+        with (io.status(op)) {
+            assert(completed == 1 ? success : failed);
+            assert(completed == 1 ? result == msg.length : result == EPIPE);
+        }
+    }
+
+    static connected = false;
+    void connectCb(IOEngine io, IO op)
+    {
+        connected = true;
+
+        with (io.status(op)) {
+            assert(failed);
+            assert(result == ECONNABORTED);
+        }
+    }
+
+    const sockets = makeSocketPair(InetAddr("127.0.0.1", 6767));
+    scope(exit) {
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    assert(0 == shutdown(sockets[1], SHUT_RDWR));
+
+    with (new EpollEngine()) {
+        submit(Send(sockets[0], 0, &cb, cast(void[]) msg));
+        submit(Send(sockets[0], 0, &cb, cast(void[]) "Test2"));
+        submit(Connect(sockets[0], 0, &connectCb, InetAddr("127.0.0.1", 6768)));
+        process();
+    }
+
+    assert(completed == 2);
+    assert(connected);
+}
+
+@("sockRecvSuccess")
+@trusted unittest
+{
+    static msg = "Test1";
+    static completed = false;
+
+    void cb(IOEngine io, IO op)
+    {
+        completed = true;
+
+        with (io.status(op)) {
+            assert(success);
+            assert(result == msg.length);
+        }
+    }
+
+    Socket[2] sockets;
+    scope(exit) {
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    assert(0 == socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, cast(int[2]) sockets));
+    assert(msg.length == send(sockets[1], msg.ptr, cast(int) msg.length, 0));
+
+    ubyte[10] buf;
+    with (new EpollEngine()) {
+        submit(Receive(sockets[0], 0, &cb, buf));
+        process();
+    }
+
+    assert(completed);
+}
+
+@("sockRecvHup")
+unittest
+{
+    static completed = 0;
+
+    void cb(IOEngine io, IO op)
+    {
+        completed++;
+
+        with (io.status(op)) {
+            assert(success);
+            assert(result == 0);
+        }
+    }
+
+    Socket[2] sockets;
+    scope(exit) {
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    assert(0 == socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, cast(int[2]) sockets));
+    assert(0 == shutdown(sockets[1], SHUT_WR));
+
+    ubyte[10] buf;
+    with (new EpollEngine()) {
+        submit(Receive(sockets[0], 0, &cb, buf));
+        submit(Read(sockets[0], 0, &cb, buf));
+        process();
+    }
+
+    assert(completed == 2);
+}
+
+/+
+Test cases:
+
+1. Connect
+    - Success
+    - Failure
+    - Connect after fail
+2. Accept
+    - Success
+    - Failure
+    - Accept after fail
+3. Read/Recv
+    - EOF/HUP handling: all subsequent scheduled reads must fail with EOF
+    - EINTR handling (retry read)
+    - Failure
+4. Write/Send
+    - Success
+    - Fail
+    - HUP handling: all subsequent scheduled writes (except Connect) must fail
+5. Chained operations
+    - Connect failed: finalize all Reads and Writes with faliure
++/
