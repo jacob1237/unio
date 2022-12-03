@@ -1,6 +1,9 @@
 {
-    "name": "unio",
-    "description": "The Unified Asynchronous IO for the D language",
-    "copyright": "Copyright © 2022 Jacob Shtokolov",
-    "targetType": "library"
+	"copyright": "Copyright © 2022 Jacob Shtokolov",
+	"dependencies": {
+		"silly": "~>1.1.1"
+	},
+	"description": "The Unified Asynchronous IO for the D language",
+	"name": "unio",
+	"targetType": "library"
 }
