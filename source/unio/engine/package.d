@@ -6,7 +6,7 @@ public import std.socket : AddressFamily, SocketType, ProtocolType;
 public import unio.engine.operations;
 
 public:
-    immutable struct IO
+    struct IO
     {
         size_t handle;
         alias handle this;
@@ -43,20 +43,33 @@ public:
         Type type = Type.Pending;
         long result;
 
-        @property bool pending()
+        @property
         {
-            return type == Type.Pending;
+            bool pending() { return type == Type.Pending; }
+            bool success() { return type == Type.Success; }
+            bool failed() { return type == Type.Error; }
         }
+    }
 
-        @property bool success()
-        {
-            return type == Type.Success;
-        }
+    struct Result
+    {
+        enum Type : byte { Success = 0, Error = -1 }
 
-        @property bool failed()
+        Type type;
+        long value;
+
+        @property
         {
-            return type == Type.Error;
+            bool done() const { return type == Type.Success; }
+            bool failed() const { return type == Type.Error; }
         }
+    }
+
+    struct Event
+    {
+        IO op;
+        Token token;
+        Result result;
     }
 
     /** 
@@ -65,6 +78,9 @@ public:
     interface IOEngine
     {
     public:
+        void open(int fd);
+        void close(int fd);
+
         IO submit(Connect);
         IO submit(Accept);
         IO submit(Receive);
@@ -73,7 +89,14 @@ public:
         IO submit(Write);
 
         bool cancel(IO);
-        Status status(IO);
+        size_t wait(size_t = 0);
 
-        size_t process();
+        void popFront();
+
+        @property
+        {
+            size_t length() const;
+            bool empty() const;
+            Event front() const;
+        }
     }

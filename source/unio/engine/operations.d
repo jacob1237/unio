@@ -2,17 +2,43 @@ module unio.engine.operations;
 
 @safe:// @nogc nothrow:
 
-import unio.engine : File, Socket, IO, IOEngine;
+import unio.engine : File, Socket, IO, IOEngine, Result;
+
+union Token
+{
+    alias Function = void function (Result);
+    alias Delegate = void delegate (Result);
+
+    size_t tag;
+    Delegate func;
+}
+
+Token toToken(size_t tag)
+{
+    return Token(tag);
+}
+
+Token toToken(Token.Function cb) @trusted
+{
+    import std.functional : toDelegate;
+    Token t = { func: toDelegate(cb) };
+    return t;
+}
+
+Token toToken(Token.Delegate cb)
+{
+    Token t = { func: cb };
+    return t;
+}
 
 mixin template Operation(T)
 {
     T fd;
-    size_t key;
-    OnComplete cb;
+    Token token;
 }
 
 public:
-    alias OnComplete = void delegate (IOEngine, immutable IO);
+    alias OnComplete = void delegate (IOEngine, IO);
 
     /** 
      * Socket address struct (sockaddr wrapper)
@@ -69,12 +95,36 @@ public:
     {
         mixin Operation!Socket;
         Address addr;
+
+        this(Socket sock, Address addr)
+        {
+            fd = sock;
+            this.addr = addr;
+        }
+
+        this(Socket sock, Address addr, Token token)
+        {
+            this(sock, addr);
+            this.token = token;
+        }
     }
 
     struct Accept
     {
         mixin Operation!Socket;
         Address* newAddr;
+
+        this(Socket sock, Address* newAddr)
+        {
+            fd = sock;
+            this.newAddr = newAddr;
+        }
+
+        this(Socket sock, Address* newAddr, Token token)
+        {
+            this(sock, newAddr);
+            this.token = token;
+        }
     }
 
     struct Receive
@@ -82,6 +132,29 @@ public:
         mixin Operation!Socket;
         void[] buf;
         int flags;
+
+        this(Socket sock, void[] buf)
+        {
+            this(sock, buf, 0);
+        }
+
+        this(Socket sock, void[] buf, int flags)
+        {
+            fd = sock;
+            this.buf = buf;
+            this.flags = flags;
+        }
+
+        this(Socket sock, void[] buf, int flags, Token token)
+        {
+            this(sock, buf, flags);
+            this.token = token;
+        }
+
+        this(Socket sock, void[] buf, Token token)
+        {
+            this(sock, buf, 0, token);
+        }
     }
 
     struct Send
@@ -89,16 +162,63 @@ public:
         mixin Operation!Socket;
         void[] buf;
         int flags;
+
+        this(Socket sock, void[] buf)
+        {
+            this(sock, buf, 0);
+        }
+
+        this(Socket sock, void[] buf, int flags)
+        {
+            fd = sock;
+            this.buf = buf;
+            this.flags = flags;
+        }
+
+        this(Socket sock, void[] buf, int flags, Token token)
+        {
+            this(sock, buf, flags);
+            this.token = token;
+        }
+
+        this(Socket sock, void[] buf, Token token)
+        {
+            this(sock, buf, 0, token);
+        }
     }
 
     struct Read
     {
         mixin Operation!File;
         void[] buf;
+
+        this(File file, void[] buf)
+        {
+            fd = file;
+            this.buf = buf;
+        }
+
+        this(File file, void[] buf, Token token)
+        {
+            this(file, buf);
+            this.token = token;
+        }
     }
 
     struct Write
     {
         mixin Operation!File;
         void[] buf;
+
+        this(File file, void[] buf)
+        {
+            fd = file;
+            this.buf = buf;
+        }
+
+        this(File file, void[] buf, Token token)
+        {
+            this(file, buf);
+            this.token = token;
+        }
     }

@@ -92,20 +92,9 @@ public:
 
     @property
     {
-        bool empty() const
-        {
-            return length() == 0;
-        }
-
-        size_t capacity() const
-        {
-            return _capacity;
-        }
-
-        size_t length() const
-        {
-            return _length;
-        }
+        bool empty() const { return length() == 0; }
+        size_t capacity() const { return _capacity; }
+        size_t length() const { return _length; }
     }
 
     void resize(in size_t newCapacity) @trusted

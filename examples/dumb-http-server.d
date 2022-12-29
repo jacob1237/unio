@@ -18,135 +18,126 @@ enum backlog = 512;
 void[maxMsgLen] buf;
 
 static response = cast(immutable void[]) (
-    "HTTP/1.1 200 OK\r\n"
-    ~ "Server: unio\r\n"
-    ~ "Connection: keep-alive\r\n"
-    ~ "Content-Type: text/plain\r\n"
-    ~ "Content-Length: 13\r\n"
-    ~ "\r\n"
-    ~ "Hello, World!"
+    "HTTP/1.1 200 OK\r\n" ~
+    "Server: unio\r\n" ~
+    "Connection: keep-alive\r\n" ~
+    "Content-Type: text/plain\r\n" ~
+    "Content-Length: 13\r\n" ~
+    "\r\n" ~
+    "Hello, World!"
 );
 
 static error404 = cast(immutable void[]) (
-    "HTTP/1.1 404 Not Found\r\n"
-    ~ "Server: unio\r\n"
-    ~ "Connection: keep-alive\r\n"
-    ~ "Content-Type: text/plain\r\n"
-    ~ "Content-Length: 9\r\n"
-    ~ "\r\n"
-    ~ "Not Found"
+    "HTTP/1.1 404 Not Found\r\n" ~
+    "Server: unio\r\n" ~
+    "Connection: keep-alive\r\n" ~
+    "Content-Type: text/plain\r\n" ~
+    "Content-Length: 9\r\n" ~
+    "\r\n" ~
+    "Not Found"
 );
+
+static IOEngine io;
 
 struct Connection
 {
 private:
     Socket sock;
-    int len;
-    bool eof;
 
-    void handleRequest(IOEngine io, size_t len) @trusted
+    void recv()
     {
-        static sep = "\r\n\r\n";
-        static favicon = "GET /favicon";
+        io.submit(Receive(sock, buf, toToken(&onRecv)));
+    }
 
-        if (len < 4) {
+    void onRecv(Result result) @trusted
+    {
+        if (result.failed || result.value == 0) {
+            disconnect();
             return;
         }
 
-        auto data = cast(ubyte[]) buf;
+        const len = result.value;
+        const data = cast(ubyte[]) buf;
 
-        for (auto i = 0; i <= len - 4; ++i)
+        static sep = "\r\n\r\n";
+        static favicon = "GET /favicon";
+
+        if (len < sep.length) return;
+
+        foreach (const i; 0 .. len - sep.length + 1)
         {
             if (data[0 .. favicon.length] == favicon) {
-                send(io, error404);
+                send(cast(void[]) error404);
                 return;
             }
 
-            if (data[i] == '\r' && data[i .. i + 4] == sep) {
-                send(io, response);
+            if (data[i] == '\r' && data[i .. i + sep.length] == sep) {
+                send(cast(void[]) response);
                 return;
             }
         }
     }
 
-    void onRecv(IOEngine io, IO op) @trusted
+    void send(void[] resp)
     {
-        with (io.status(op))
-        {
-            if (failed || result == 0) {
-                close();
-                return;
-            }
-
-            handleRequest(io, result);
-        }
+        io.submit(Send(sock, resp, toToken(&onSend)));
     }
 
-    void onSend(IOEngine io, IO op)
+    void onSend(Result result)
     {
-        io.status(op); // Cleanup
-        recv(io);
-    }
-
-    void recv(IOEngine io)
-    {
-        io.submit(Receive(sock, 0, &onRecv, buf));
-    }
-
-    void send(IOEngine io, immutable void[] resp) @trusted
-    {
-        io.submit(Send(sock, 0, &onSend, cast(void[]) resp));
+        recv();
     }
 
 public:
-    void close()
+    void connect(Socket sock)
+    {
+        this.sock = sock;
+        recv();
+    }
+
+    void disconnect()
     {
         writeln("Connection closed");
-        closeSocket(sock);
+        io.close(sock);
     }
 }
 
 struct Server
 {
 private:
-    IOEngine io;
     Socket sock;
     InetAddr addr;
     Connection[maxClients] conns;
     bool running;
 
-    void onConnect(IOEngine io, IO op)
+    void accept()
+    {
+        io.submit(Accept(sock, &addr.val, toToken(&onAccept)));
+    }
+
+    void onAccept(Result result)
     {
         writefln("New connection from %s:%d", addr, addr.port);
 
-        auto status = io.status(op);
-
-        if (status.failed) {
+        if (result.failed) {
             stop();
             return;
         }
 
-        immutable fd = Socket(cast(int) status.result);
-        auto conn = &conns[fd];
-        conn.sock = fd;
-        conn.recv(io);
+        const fd = Socket(cast(int) result.value);
+        conns[fd].connect(fd);
 
+        // Continue accepting connections
         accept();
     }
 
-    void accept()
-    {
-        io.submit(Accept(sock, 0, &onConnect, &addr.val));
-    }
-
 public:
-    this(IOEngine engine, InetAddr addr) @trusted
+    this(InetAddr addr) @trusted
     {
         import core.sys.posix.netinet.in_;
         import core.sys.posix.sys.socket;
         import core.sys.linux.netinet.tcp;
 
-        io = engine;
         this.addr = addr;
 
         int flags = 1;
@@ -163,7 +154,7 @@ public:
 
     ~this()
     {
-        closeSocket(sock);
+        io.close(sock);
     }
 
     void stop()
@@ -171,27 +162,26 @@ public:
         running = false;
     }
 
-    void run()
+    void run() @trusted
     {
         writefln("Server started at http://%s:%d", addr, addr.port);
-
         accept();
 
         running = true;
-        while(running && io.process()) {}
-    }
-}
 
-void closeSocket(Socket s)
-{
-    import core.sys.posix.unistd : close;
-    close(s);
+        while(running)
+        {
+            io.wait();
+
+            foreach (const event; io) {
+                event.token.func(event.result);
+            }
+        }
+    }
 }
 
 void main()
 {
-    Server(
-        new EpollEngine(),
-        InetAddr("0.0.0.0", 8080)
-    ).run();
+    io = new EpollEngine();
+    Server(InetAddr("0.0.0.0", 8080)).run();
 }

@@ -85,11 +85,7 @@ private:
         }
 
         int flags;
-
-        @property bool isWrite() const
-        {
-            return cast(bool) (type & 0xF0);
-        }
+        @property bool isWrite() const { return cast(bool) (type & 0xF0); }
     }
 
     /** 
@@ -100,7 +96,7 @@ private:
         auto entry = Task(
             mixin("OpType." ~ Op.stringof),
             Status.Type.Pending,
-            Task.Data(cast(size_t) op.fd, op.key, op.cb)
+            Task.Data(cast(size_t) op.fd, op.token)
         );
 
         static if (__traits(hasMember, Op, "buf")) entry.buf = op.buf;
@@ -109,6 +105,11 @@ private:
         static if (__traits(hasMember, Op, "flags")) entry.flags = op.flags;
 
         return entry;
+    }
+
+    Result.Type toResultType(Status.Type type)
+    {
+        return type == Status.Type.Success ? Result.Type.Success : Result.Type.Error;
     }
 
     // TODO: Handle getsockopt() error as well as the fd type
@@ -127,6 +128,7 @@ public:
      *
      * TODO: Get rid of callbacks in favor of completion queue
      * TODO: Add support for the `Wait` operation
+     * TODO: Add suport for the `Timeout` operation
      * TODO: Distinguish different types of file descriptors
      * TODO: Add operation chaining
      * TODO: Add support for timers
@@ -151,6 +153,7 @@ public:
 
         enum maxEvents = 256;
         enum queueSize = 1024;
+        enum completionQueueSize = queueSize * 2;
         enum initialCapacity = 1024;
 
     protected:
@@ -169,6 +172,7 @@ public:
 
         // Run queue
         RingBuffer!(Key, queueSize) runQueue;
+        RingBuffer!(Event, completionQueueSize) completionQueue;
 
         /** 
          * Finish the task and set its result
@@ -204,9 +208,10 @@ public:
                 }
             }
 
-            if (task.data.cb !is null) {
-                task.data.cb(this, IO(taskId));
-            }
+            const event = Event(IO(taskId), task.data.token, Result(status.toResultType, task.result));
+            completionQueue.put(event);
+
+            tasks.remove(taskId);
         }
 
         auto dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
@@ -246,12 +251,15 @@ public:
 
         auto dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
         {
-            if (fdi.read.state == Pipeline.State.hup) return 0;
-
-            const ret = recv(fdi.fd, task.buf.ptr, task.buf.length, task.flags);
-            if (ret == 0) fdi.read.state = Pipeline.State.hup;
-
-            return ret;
+            switch (fdi.read.state)
+            {
+                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
+                case Pipeline.State.hup: return 0;
+                default:
+                    const ret = recv(fdi.fd, task.buf.ptr, task.buf.length, task.flags);
+                    if (ret == 0) fdi.read.state = Pipeline.State.hup;
+                    return ret;
+            }
         }
 
         auto dispatchWrite(ref FDInfo fdi, ref Task task) @trusted
@@ -268,50 +276,81 @@ public:
             }
         }
 
+        /**
+         * Execute scheduled task
+         *
+         * TODO: Get rid of switch-case here to achieve cache-friendliness
+         */
+        void runTask(ref FDInfo fdi, ref Task task, const Key taskId)
+        {
+            (ref Pipeline pipeline)
+            {
+                // Just a hack for now
+                // TODO: Handle EPOLLRDHUP correctly
+                if (pipeline.state == Pipeline.State.hup && task.isWrite) {
+                    completeTask(pipeline, taskId, task, EPIPE);
+                    return;
+                }
+
+                long ret;
+
+                final switch (task.type)
+                {
+                    case OpType.Accept: ret = dispatchAccept(fdi, task); break;
+                    case OpType.Connect: ret = dispatchConnect(fdi, task); break;
+                    case OpType.Read: ret = dispatchRead(fdi, task); break;
+                    case OpType.Write: ret = dispatchWrite(fdi, task); break;
+                    case OpType.Receive: ret = dispatchRecv(fdi, task); break;
+                    case OpType.Send: ret = dispatchSend(fdi, task); break;
+                }
+
+                completeTask(pipeline, taskId, task, ret);
+            }(fdi.pipeline(task));
+        }
+
         /** 
          * Execute all pending tasks from the run queue
          *
-         * TODO: Get rid of switch-case here to achieve cache-friendliness
          * TODO: Hadle partial reads and writes (when the descriptor is not ready)
          * TODO: Reset pipeline state after errors and HUP (to allow submit new operations)
          */
-        void runTasks() @trusted
+        void runTasks()
         {
             for (; !runQueue.empty; runQueue.popFront())
             {
                 auto taskId = runQueue.front;
                 auto task = tasks.get(taskId);
 
-                if (task.isNull) {
-                    continue;
-                }
-
-                if (auto fdi = task.data.fd in fds)
-                {
-                    auto pipeline = fdi.pipeline(task);
-
-                    // Just a hack for now
-                    // TODO: Handle EPOLLRDHUP correctly
-                    if (pipeline.state == Pipeline.State.hup && task.isWrite) {
-                        completeTask(pipeline, taskId, task, EPIPE);
-                        continue;
-                    }
-
-                    long ret;
-
-                    final switch (task.type)
-                    {
-                        case OpType.Accept: ret = dispatchAccept(*fdi, task); break;
-                        case OpType.Connect: ret = dispatchConnect(*fdi, task); break;
-                        case OpType.Read: ret = dispatchRead(*fdi, task); break;
-                        case OpType.Write: ret = dispatchWrite(*fdi, task); break;
-                        case OpType.Receive: ret = dispatchRecv(*fdi, task); break;
-                        case OpType.Send: ret = dispatchSend(*fdi, task); break;
-                    }
-
-                    completeTask(pipeline, taskId, task, ret);
+                if (!task.isNull) {
+                    fds.get(task.data.fd, (ref FDInfo fdi) => runTask(fdi, task, taskId));
                 }
             }
+        }
+
+        /** 
+         * Register the file descriptor in Epoll and our internal data structures
+         */
+        FDInfo register(int fd) @trusted
+        {
+            epoll_event ev = { events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP, data: { fd: fd }};
+            epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
+            return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.notReady));
+        }
+
+        /** 
+         * Unregister the file descriptor in Epoll and clean up internal resources
+         */
+        void unregister(int fd)
+        {
+            fds.get(fd, (ref FDInfo fdi) @trusted
+            {
+                // TODO: remove all tasks chain for the related FDInfo
+                if (fdi.read.head) tasks.remove(fdi.read.head);
+                if (fdi.write.head) tasks.remove(fdi.write.head);
+
+                fds.remove(fd);
+                epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
+            });
         }
 
         /** 
@@ -323,12 +362,8 @@ public:
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
-            auto fdi = &fds.require(fd, {
-                epoll_event ev = { events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP, data: { fd: fd }};
-                epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
-
-                return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.notReady));
-            }());
+            // TODO: get rid of pointer semantics here
+            auto fdi = &fds.require(fd, register(fd));
 
             /*
              * When we already have the FDInfo in our list, we just need to update
@@ -367,7 +402,7 @@ public:
         /** 
          * Process events coming from the epoll socket
          */
-        void processEvents() @trusted
+        void processEvents(size_t minTasks = 0) @trusted
         {
             auto ret = epoll_wait(epoll, events.ptr, cast(int) events.length, -1);
 
@@ -446,44 +481,55 @@ public:
         }
 
         /** 
-         * Check status of some IO operation
+         * Execute the tasks and wait for completion events
          *
-         * Please note that when the status is not Pending, the task entry
-         *  will be automatically cleaned up after calling this function
+         * Params:
+         *   minTasks = minimum tasks to be completed before wake up from `wait()`
          */
-        Status status(IO op)
+        size_t wait(size_t minTasks = 1)
         {
-            const key = Key(op);
-            const task = tasks.get(key);
-            const result = Status(task.status, task.result);
+            if (!tasks.empty)
+            {
+                runTasks();
+                if (length) return tasks.length;
 
-            if (task.status != Status.Type.Pending) {
-                tasks.remove(key);
+                processEvents(minTasks);
+                runTasks();
             }
 
-            return result;
+            return tasks.length;
+        }
+
+        void popFront() { completionQueue.popFront(); }
+
+        @property
+        {
+            size_t length() const { return completionQueue.length; }
+            bool empty() const { return completionQueue.empty; }
+            Event front() const { return completionQueue.front; }
         }
 
         /** 
-         * Receive OS events and perform loop tasks
-         * TODO: Get rid of duplicate calls to `runTasks` and `processSumbissionQueue`
+         * TODO: report errors when registering the descriptor
          */
-        size_t process()
+        void open(int fd)
         {
-            if (tasks.empty) {
-                return 0;
-            }
+            register(fd);
+        }
 
-            runTasks();
-            processEvents();
-            runTasks();
-
-            return tasks.length;
+        void close(int fd)
+        {
+            unregister(fd);
+            .close(fd);
         }
     }
 
 version(unittest)
 {
+    import std.algorithm.iteration : map;
+    import std.typecons : tuple;
+    import std.array : assocArray;
+
     Socket makeServerSocket(InetAddr addr) @trusted
     {
         const fd = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
@@ -511,6 +557,38 @@ version(unittest)
 
         return [client, Socket(server)];
     }
+
+    alias Comparator = void delegate (ref Event);
+
+    void assertCompletion()(IOEngine io, Comparator[IO] expected)
+    {
+        assert(!io.empty);
+        assert(io.length == expected.length);
+
+        auto results = expected.dup;
+
+        foreach (ref ev; io)
+        {
+            assert(ev.op in expected, "Unknown event");
+            results[ev.op](ev);
+            results.remove(ev.op);
+        }
+
+        assert(!results.length, "Expected events are not present");
+    }
+
+    void assertCompletion(IOEngine io, Event[] expected)
+    {
+        assert(io.length == expected.length);
+
+        Comparator[IO] results;
+
+        foreach (const ref ev; expected) {
+            results[ev.op] = ((Event src) => (ref Event dst) => assert(src == dst))(ev);
+        }
+
+        assertCompletion(io, results);
+    }
 }
 
 /**
@@ -518,31 +596,26 @@ version(unittest)
  *       other data must not be passed as pointers. To achieve this, we should either pass
  *       a callback or some struct/class that will provide the pointer (requires testing)
  */
-@("fdStdRead")
+@("fileReadStd")
 unittest
 {
     import std.stdio : stdout;
 
-    void cb(IOEngine io, IO op) { io.status(op); }
-
     ubyte[4] buf;
     auto fd = (() @trusted => File(stdout.fileno))();
 
-    with (new EpollEngine()) {
-        submit(Read(fd, 0, &cb, buf));
-        assert(1 == process(), "Read operation must be blocking");
+    with (new EpollEngine())
+    {
+        submit(Read(fd, buf));
+        assert(wait() == 1, "Read operation must be blocking");
+        assert(empty);
+        assert(length == 0);
     }
 }
 
 @("sockConnectAccept")
 @trusted unittest
 {
-    static bool accepted;
-    void serverCb(IOEngine io, IO op) { accepted = true; assert(io.status(op).result > 0);}
-
-    static bool connected;
-    void clientCb(IOEngine io, IO op) { connected = true; io.status(op); }
-
     // Server
     const serverAddr = InetAddr("127.0.0.1", 6760);
     const server = makeServerSocket(serverAddr);
@@ -556,21 +629,25 @@ unittest
         close(server);
     }
 
-    with (new EpollEngine()) {
-        submit(Accept(server, 0, &serverCb, &clientAddr.val));
-        submit(Connect(client, 0, &clientCb, serverAddr));
-        process();
-    }
+    auto io = new EpollEngine();
 
-    assert(connected);
-    assert(accepted);
+    with (io)
+    {
+        const opAccept = submit(Accept(server, &clientAddr.val));
+        const opConnect = submit(Connect(client, serverAddr));
+
+        assert(wait() == 0);
+
+        assertCompletion(io, cast(Comparator[IO]) [
+            opAccept: (ref Event e) => assert(e.token.tag == 0 && e.result.done && e.result.value > 0),
+            opConnect: (ref Event e) => assert(e == Event(opConnect, Token(), Result(Result.Type.Success, 0))),
+        ]);
+    }
 }
 
 @("sockWriteSuccess")
 @trusted unittest
 {
-    import std.stdio;
-
     Socket[2] sockets;
     assert(0 == socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, cast(int[2]) sockets));
     scope(exit) {
@@ -581,21 +658,17 @@ unittest
     const client = sockets[0];
     const server = sockets[1];
 
-    static completed = false;
     static msg = cast(void[]) "Hello, world";
 
-    void cb(IOEngine io, IO op)
+    auto io = new EpollEngine();
+
+    with (io)
     {
-        completed = true;
-        assert(io.status(op).result == msg.length);
-    }
+        const opWrite = submit(Write(client, msg));
+        assert(wait() == 0);
 
-    with (new EpollEngine()) {
-        submit(Write(client, 0, &cb, msg));
-        process();
+        assertCompletion(io, [Event(opWrite, Token(), Result(Result.Type.Success, msg.length))]);
     }
-
-    assert(completed);
 
     // Check data on the other end of the socket
     ubyte[100] buf;
@@ -605,55 +678,24 @@ unittest
 @("sockSendFail")
 @trusted unittest
 {
-    static completed = false;
-
-    void cb(IOEngine io, IO op)
-    {
-        completed = true;
-
-        with (io.status(op)) {
-            assert(failed);
-            assert(result == EPIPE);
-        }
-    }
-
     const fd = Socket(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
     scope(exit) close(fd);
 
-    with (new EpollEngine()) {
-        submit(Send(fd, 0, &cb, cast(void[]) "Test"));
-        process();
-    }
+    auto io = new EpollEngine();
 
-    assert(completed);
+    with (io)
+    {
+        const opSend = submit(Send(fd, cast(void[]) "Test"));
+        assert(wait() == 0);
+
+        assertCompletion(io, [Event(opSend, Token(), Result(Result.Type.Error, EPIPE))]);
+    }
 }
 
 @("sockSendHup")
 @trusted unittest
 {
     static msg = cast(immutable void[]) "Test1";
-
-    static completed = 0;
-    void cb(IOEngine io, IO op)
-    {
-        completed++;
-
-        with (io.status(op)) {
-            assert(completed == 1 ? success : failed);
-            assert(completed == 1 ? result == msg.length : result == EPIPE);
-        }
-    }
-
-    static connected = false;
-    void connectCb(IOEngine io, IO op)
-    {
-        connected = true;
-
-        with (io.status(op)) {
-            assert(failed);
-            assert(result == ECONNABORTED);
-        }
-    }
 
     const sockets = makeSocketPair(InetAddr("127.0.0.1", 6767));
     scope(exit) {
@@ -663,15 +705,22 @@ unittest
 
     assert(0 == shutdown(sockets[1], SHUT_RDWR));
 
-    with (new EpollEngine()) {
-        submit(Send(sockets[0], 0, &cb, cast(void[]) msg));
-        submit(Send(sockets[0], 0, &cb, cast(void[]) "Test2"));
-        submit(Connect(sockets[0], 0, &connectCb, InetAddr("127.0.0.1", 6768)));
-        process();
-    }
+    auto io = new EpollEngine();
 
-    assert(completed == 2);
-    assert(connected);
+    with (io)
+    {
+        const opSend1 = submit(Send(sockets[0], cast(void[]) msg));
+        const opSend2 = submit(Send(sockets[0], cast(void[]) "Test2"));
+        const opConnect = submit(Connect(sockets[0], InetAddr("127.0.0.1", 6768)));
+
+        assert(wait() == 0);
+
+        assertCompletion(io, [
+            Event(opSend1, Token(), Result(Result.Type.Success, msg.length)),
+            Event(opSend2, Token(), Result(Result.Type.Error, EPIPE)),
+            Event(opConnect, Token(), Result(Result.Type.Error, ECONNABORTED)),
+        ]);
+    }
 }
 
 @("sockRecvSuccess")
@@ -679,16 +728,6 @@ unittest
 {
     static msg = "Test1";
     static completed = false;
-
-    void cb(IOEngine io, IO op)
-    {
-        completed = true;
-
-        with (io.status(op)) {
-            assert(success);
-            assert(result == msg.length);
-        }
-    }
 
     Socket[2] sockets;
     scope(exit) {
@@ -700,29 +739,20 @@ unittest
     assert(msg.length == send(sockets[1], msg.ptr, cast(int) msg.length, 0));
 
     ubyte[10] buf;
-    with (new EpollEngine()) {
-        submit(Receive(sockets[0], 0, &cb, buf));
-        process();
-    }
 
-    assert(completed);
+    auto io = new EpollEngine();
+
+    with (io)
+    {
+        const opRecv = submit(Receive(sockets[0], buf));        
+        assert(wait() == 0);
+        assertCompletion(io, [Event(opRecv, Token(), Result(Result.Type.Success, msg.length))]);
+    }
 }
 
 @("sockRecvHup")
 unittest
 {
-    static completed = 0;
-
-    void cb(IOEngine io, IO op)
-    {
-        completed++;
-
-        with (io.status(op)) {
-            assert(success);
-            assert(result == 0);
-        }
-    }
-
     Socket[2] sockets;
     scope(exit) {
         close(sockets[0]);
@@ -733,13 +763,20 @@ unittest
     assert(0 == shutdown(sockets[1], SHUT_WR));
 
     ubyte[10] buf;
-    with (new EpollEngine()) {
-        submit(Receive(sockets[0], 0, &cb, buf));
-        submit(Read(sockets[0], 0, &cb, buf));
-        process();
-    }
 
-    assert(completed == 2);
+    auto io = new EpollEngine();
+
+    with (io)
+    {
+        const opRecv = submit(Receive(sockets[0], buf));
+        const opRead = submit(Read(sockets[0], buf));
+        assert(wait() == 0);
+
+        assertCompletion(io, [
+            Event(opRecv, Token(), Result(Result.Type.Success, 0)),
+            Event(opRead, Token(), Result(Result.Type.Success, 0)),
+        ]);
+    }
 }
 
 /+

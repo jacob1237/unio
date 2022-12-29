@@ -1,7 +1,8 @@
-module unio.primitives.queue;
+    module unio.primitives.queue;
 
 @safe @nogc:
 
+import core.lifetime : copyEmplace;
 import std.range.primitives : isInputRange, isOutputRange, hasLength;
 import std.range.interfaces : InputRange, OutputRange;
 
@@ -31,18 +32,14 @@ pure nothrow:
 private:
     E[Capacity] data;
     size_t head = 0, tail = 0;
-
-    size_t next(in size_t val) const
-    {
-        return (val + 1) % Capacity;
-    }
+    size_t next(in size_t val) const { return (val + 1) % Capacity; }
 
 public:
     @property
     {
         bool empty() const { return tail == head; }
         bool full() const { return next(tail) == head; }
-        E front() const { return data[head]; }
+        immutable(E) front() const { return data[head]; }
         size_t capacity() const { return Size; }
         size_t length() const { return tail - head; }
     }
@@ -62,12 +59,12 @@ public:
         }
     }
 
-    void put(E elem)
+    void put(E elem) @trusted
     {
         immutable nextTail = next(tail);
 
         if (nextTail != head) {
-            data[tail] = elem;
+            copyEmplace(elem, data[tail]);
             tail = nextTail;
         }
     }
