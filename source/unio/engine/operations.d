@@ -6,7 +6,6 @@ import unio.engine : File, Socket, IO, IOEngine, Result;
 
 union Token
 {
-    alias Function = void function (Result);
     alias Delegate = void delegate (Result);
 
     size_t tag;
@@ -16,13 +15,6 @@ union Token
 Token toToken(size_t tag)
 {
     return Token(tag);
-}
-
-Token toToken(Token.Function cb) @trusted
-{
-    import std.functional : toDelegate;
-    Token t = { func: toDelegate(cb) };
-    return t;
 }
 
 Token toToken(Token.Delegate cb)

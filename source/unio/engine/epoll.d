@@ -416,6 +416,7 @@ public:
                 const fd = ev.data.fd;
                 auto fdi = fd in fds;
 
+                // TODO: get rid of pointers here
                 if (!fdi) {
                     epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
                     continue;

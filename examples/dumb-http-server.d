@@ -164,10 +164,10 @@ public:
 
     void run() @trusted
     {
-        writefln("Server started at http://%s:%d", addr, addr.port);
         accept();
-
         running = true;
+
+        writefln("Server started at http://%s:%d", addr, addr.port);
 
         while(running)
         {
