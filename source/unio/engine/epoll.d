@@ -321,7 +321,7 @@ public:
                 auto task = tasks.get(taskId);
 
                 if (!task.isNull) {
-                    fds.get(task.data.fd, (ref FDInfo fdi) => runTask(fdi, task, taskId));
+                    fds.take(task.data.fd, (ref FDInfo fdi) => runTask(fdi, task, taskId));
                 }
             }
         }
@@ -341,7 +341,7 @@ public:
          */
         void unregister(int fd)
         {
-            fds.get(fd, (ref FDInfo fdi) @trusted
+            fds.take(fd, (ref FDInfo fdi) @trusted
             {
                 // TODO: Remove all tasks chain for the related FDInfo
                 if (fdi.read.head) tasks.remove(fdi.read.head);
@@ -361,36 +361,36 @@ public:
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
-            // TODO: Get rid of pointer semantics here
-            auto fdi = &fds.require(fd, register(fd));
-
-            /*
-             * When we already have the FDInfo in our list, we just need to update
-             * pointers for the associated tasks, but we must consider two scenarios:
-             *
-             * 1. There are no associated tasks for this descriptor
-             * 2. There are already some scheduled tasks
-             */
-            with (fdi.pipeline(task))
+            with (fds.require(fd, register(fd)))
             {
-                if (!head)
+                /*
+                * When we already have the FDInfo in our list, we just need to update
+                * pointers for the associated tasks, but we must consider two scenarios:
+                *
+                * 1. There are no associated tasks for this descriptor
+                * 2. There are already some scheduled tasks
+                */
+                with (pipeline(task))
                 {
-                    head = taskId;
-                    tail = taskId;
-
-                    // Immediately put the task to the run queue because the file
-                    // descriptor is ready to perform reads or writes
-                    if (state == Pipeline.State.ready || task.isWrite) {
-                        runQueue.put(taskId);
-                    }
-                }
-                else
-                {
-                    auto lastTask = tasks.get(tail);
-
-                    if (!lastTask.isNull) {
-                        lastTask.next = taskId;
+                    if (!head)
+                    {
+                        head = taskId;
                         tail = taskId;
+
+                        // Immediately put the task to the run queue because the file
+                        // descriptor is ready to perform reads or writes
+                        if (state == Pipeline.State.ready || task.isWrite) {
+                            runQueue.put(taskId);
+                        }
+                    }
+                    else
+                    {
+                        auto lastTask = tasks.get(tail);
+
+                        if (!lastTask.isNull) {
+                            lastTask.next = taskId;
+                            tail = taskId;
+                        }
                     }
                 }
             }
@@ -415,31 +415,32 @@ public:
                 const fd = ev.data.fd;
                 auto fdi = fd in fds;
 
-                // TODO: Get rid of pointers here
-                if (!fdi) {
-                    epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
-                    continue;
-                }
+                fds.take(
+                    fd,
+                    (ref FDInfo fdi)
+                    {
+                        // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
+                        if (ev.events & EPOLLIN)
+                        {
+                            fdi.read.state =
+                                ev.events & EPOLLERR ? Pipeline.State.error :
+                                ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
-                if (ev.events & EPOLLIN)
-                {
-                    fdi.read.state =
-                        ev.events & EPOLLERR ? Pipeline.State.error :
-                        ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
+                            if (tasks.has(fdi.read.head)) runQueue.put(fdi.read.head);
+                        }
 
-                    if (tasks.has(fdi.read.head)) runQueue.put(fdi.read.head);
-                }
+                        // TODO: Handle partially-completed write operations (and retries in case of EINTR)
+                        if (ev.events & EPOLLOUT)
+                        {
+                            fdi.write.state =
+                                ev.events & EPOLLERR ? Pipeline.State.error :
+                                ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                // TODO: Handle partially-completed write operations (and retries in case of EINTR)
-                if (ev.events & EPOLLOUT)
-                {
-                    fdi.write.state =
-                        ev.events & EPOLLERR ? Pipeline.State.error :
-                        ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
-
-                    if (tasks.has(fdi.write.head)) runQueue.put(fdi.write.head);
-                }
+                            if (tasks.has(fdi.write.head)) runQueue.put(fdi.write.head);
+                        }
+                    },
+                    () @trusted { epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null); }
+                );
             }
         }
 
