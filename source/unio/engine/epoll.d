@@ -126,6 +126,7 @@ public:
     /** 
      * Epoll IO engine implementation
      *
+     * TODO: Add `Cancel` support for all operations on a specific file descriptor
      * TODO: Add support for the `Wait` operation
      * TODO: Add suport for the `Timeout` operation
      * TODO: Distinguish different types of file descriptors
