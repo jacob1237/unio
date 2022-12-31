@@ -126,12 +126,10 @@ public:
     /** 
      * Epoll IO engine implementation
      *
-     * TODO: Get rid of callbacks in favor of completion queue
      * TODO: Add support for the `Wait` operation
      * TODO: Add suport for the `Timeout` operation
      * TODO: Distinguish different types of file descriptors
      * TODO: Add operation chaining
-     * TODO: Add support for timers
      * TODO: Add support for async file operations (via AIO/io_submit or a dedicated thread pool)
      * TODO: Handle connection errors both for read/write operations
      * TODO: Rename read/write task types to input/output
@@ -237,7 +235,7 @@ public:
         }
 
         /** 
-         * TODO: handle EOF (or peer shutdown)
+         * TODO: Handle EOF (or peer shutdown)
          */
         auto dispatchRead(ref FDInfo fdi, ref Task task) @trusted
         {
@@ -312,7 +310,7 @@ public:
          * Execute all pending tasks from the run queue
          *
          * TODO: Hadle partial reads and writes (when the descriptor is not ready)
-         * TODO: Reset pipeline state after errors and HUP (to allow submit new operations)
+         * TODO: Reset pipeline state after errors and HUP (to allow submitting new operations)
          */
         void runTasks()
         {
@@ -344,7 +342,7 @@ public:
         {
             fds.get(fd, (ref FDInfo fdi) @trusted
             {
-                // TODO: remove all tasks chain for the related FDInfo
+                // TODO: Remove all tasks chain for the related FDInfo
                 if (fdi.read.head) tasks.remove(fdi.read.head);
                 if (fdi.write.head) tasks.remove(fdi.write.head);
 
@@ -362,7 +360,7 @@ public:
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
-            // TODO: get rid of pointer semantics here
+            // TODO: Get rid of pointer semantics here
             auto fdi = &fds.require(fd, register(fd));
 
             /*
@@ -416,7 +414,7 @@ public:
                 const fd = ev.data.fd;
                 auto fdi = fd in fds;
 
-                // TODO: get rid of pointers here
+                // TODO: Get rid of pointers here
                 if (!fdi) {
                     epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
                     continue;
@@ -511,7 +509,7 @@ public:
         }
 
         /** 
-         * TODO: report errors when registering the descriptor
+         * TODO: Report errors when registering the descriptor
          */
         void open(int fd)
         {

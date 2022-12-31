@@ -125,10 +125,6 @@ public:
         void[] buf;
         int flags;
 
-        this(Socket sock, void[] buf)
-        {
-            this(sock, buf, 0);
-        }
 
         this(Socket sock, void[] buf, int flags)
         {
@@ -143,10 +139,8 @@ public:
             this.token = token;
         }
 
-        this(Socket sock, void[] buf, Token token)
-        {
-            this(sock, buf, 0, token);
-        }
+        this(Socket sock, void[] buf) { this(sock, buf, 0); }
+        this(Socket sock, void[] buf, Token token) { this(sock, buf, 0, token); }
     }
 
     struct Send
@@ -155,10 +149,6 @@ public:
         void[] buf;
         int flags;
 
-        this(Socket sock, void[] buf)
-        {
-            this(sock, buf, 0);
-        }
 
         this(Socket sock, void[] buf, int flags)
         {
@@ -173,10 +163,8 @@ public:
             this.token = token;
         }
 
-        this(Socket sock, void[] buf, Token token)
-        {
-            this(sock, buf, 0, token);
-        }
+        this(Socket sock, void[] buf) { this(sock, buf, 0); }
+        this(Socket sock, void[] buf, Token token) { this(sock, buf, 0, token); }
     }
 
     struct Read
