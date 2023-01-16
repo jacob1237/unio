@@ -12,15 +12,8 @@ struct Key
     size_t val;
     alias val this;
 
-    this(size_t v)
-    {
-        val = v;
-    }
-
-    bool opCast(T : bool)() const
-    {
-        return val != Key(0);
-    }
+    this(size_t v) { val = v; }
+    bool opCast(T : bool)() const { return val != Key(0); }
 }
 
 public interface Pool(T)

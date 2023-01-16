@@ -1,4 +1,4 @@
-    module unio.primitives.queue;
+module unio.primitives.queue;
 
 @safe @nogc:
 

@@ -1,6 +1,6 @@
 module unio.engine.epoll;
 
-@safe:// @nogc:
+@safe:
 
 public import unio.engine;
 
@@ -148,6 +148,7 @@ public:
         import core.sys.posix.sys.socket;
         import core.time : Duration, msecs;
 
+        import std.experimental.allocator : make, dispose;
         import std.experimental.allocator.mallocator : Mallocator;
 
         enum maxEvents = 256;
@@ -166,7 +167,7 @@ public:
         /** 
          * Queue-related
          */
-        FDSet!FDInfo fds;
+        Table!(FDInfo, initialCapacity, Mallocator) fds;
         FreeList!(Task, Mallocator) tasks;
 
         // Run queue
@@ -413,7 +414,6 @@ public:
             foreach (ref ev; events[0 .. ret])
             {
                 const fd = ev.data.fd;
-                auto fdi = fd in fds;
 
                 fds.take(
                     fd,
@@ -448,7 +448,8 @@ public:
         this(size_t minCapacity = initialCapacity) @trusted
         {
             epoll = epoll_create1(0);
-            tasks = new typeof(tasks)(minCapacity);
+            tasks = make!(typeof(tasks))(Mallocator.instance, minCapacity);
+            fds.initialize();
         }
 
         /** 
@@ -456,7 +457,9 @@ public:
          */
         ~this() @trusted
         {
-            close(epoll);
+            .close(epoll);
+            dispose(Mallocator.instance, tasks);
+            fds.free();
         }
 
         alias List(Elem...) = Elem;

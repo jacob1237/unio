@@ -16,6 +16,20 @@ public:
     {
         int fd;
         alias fd this;
+
+        /** 
+         * On Windows, we transform file descriptors dividing them by 4 (right bitwise shift),
+         * because kernel handles are always multiple of 4 and the bottom two bits are useless for us.
+         *
+         * Source: https://devblogs.microsoft.com/oldnewthing/20050121-00/?p=36633
+         */
+        size_t toHash() const nothrow
+        {
+            version (Windows) return fd >> 2;
+            else return fd;
+        }
+
+        bool opEquals(ref const typeof(this) f) const { return fd == f.fd; }
     }
 
     struct Socket
