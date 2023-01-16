@@ -37,7 +37,6 @@ import std.experimental.allocator : make, dispose, makeArray, expandArray;
 
 TODO: Idea - express data as a table of columns and rows and describe it in the doc block
  */
-@nogc
 public struct Table(T, size_t ChunkLength, Allocator)
 {
     private:
