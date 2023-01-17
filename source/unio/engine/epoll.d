@@ -731,7 +731,6 @@ unittest
 @trusted unittest
 {
     static msg = "Test1";
-    static completed = false;
 
     Socket[2] sockets;
     scope(exit) {
