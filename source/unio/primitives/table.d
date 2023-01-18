@@ -5,38 +5,23 @@ module unio.primitives.table;
 import std.experimental.allocator : make, dispose, makeArray, expandArray;
 
 /** 
- * The Table implements a similar interface to associative array, but instead of using
- * a hash function, it maps sequential numeric keys into values pretty much like a simple array does.
- *
- * However, there are key differences:
- *
- * 1. The data is chunked, so when the array grows, it allocates the next chunk for new data
- * 2. It's possible to insert an index far away from the beginning and it will not allocate
- *    all intermediary chunks, but only the chunk holding the particular key/index
- * 3. The chunk is freed automatically when becomes empty
- * 4. Implements both hashmap and Option-like interface, allowing to work with empty values
- *
- * Notes:
- *
- * - The map itself handles alloc/dealloc of memory blocks
- * - To provide smooth allocation, the FreeList allocator must be used:
- *     - It handles edge-cases where the block constantly allocates/frees
- *       (add/remove items that are on the edge of the block)
- *
- * Algorithm:
- *
- * 1. Pre-allocate two blocks of memory defined by chunk size, one for data, the second one is reserved
- * 2. Ask for a first block in the Map code (allocate/makeArray)
+The Table implements a similar interface to associative array, but instead of using
+a hash function, it maps sequential numeric keys into values pretty much like a simple array does.
 
- Problem:
+However, there are key differences:
 
-    [oooo][o---][oooo][---o]
+1. The data is chunked in rows, so when the array grows, it allocates the next chunk for new data
+2. It's possible to insert an index far away from the beginning and it will not allocate
+   all intermediary chunks (rows), but only the chunk holding the particular key/index
+3. The chunk is freed automatically when becomes empty
+4. Implements both hashmap and Option-like interface, allowing to work with empty values
 
- There are multiple blocks of memory that require alloc/free
- SOLUTION: don't think about it now
-
-TODO: Idea - express data as a table of columns and rows and describe it in the doc block
- */
+TODO: Introduce an appropriate growth strategy for the index array (growth factor?)
+TODO: Automatically shrink the index array when it becomes partially empty
+TODO: Use the custom FreeList allocator on top of the Allocator internally to prevent performance issues
+TODO: Write proper unit tests for each Table method and a couple of functional tests
+TODO: Allow the RowLength to be defined at runtime (dynamically)
+*/
 public struct Table(T, size_t RowLength, Allocator)
 {
     private:
@@ -140,8 +125,8 @@ public struct Table(T, size_t RowLength, Allocator)
         }
 
         /** 
-        * Takes value from the array and runs a delegate on it if exists.
-        * If the value is not present, executes the notFound() callback
+        Takes value from the array and runs a delegate on it if exists.
+        If the value is not present, executes the notFound() callback
         */
         void take(Fn)(const size_t idx, Fn found)
         {
@@ -157,15 +142,15 @@ public struct Table(T, size_t RowLength, Allocator)
         }
 
         /** 
-         * Similar to AAs `require()`, the function returns a reference to the table entry
-         * or creates a new one from the given initial value before returning
-         *
-         * Params:
-         *   idx = Index of the entry
-         *   newVal = User-defined default value
-         * Returns:
-         *   Reference to the value within the table
-         */
+        Similar to AAs `require()`, the function returns a reference to the table entry
+        or creates a new one from the given initial value before returning
+        
+        Params:
+          idx = Index of the entry
+          newVal = User-defined default value
+        Returns:
+          Reference to the value within the table
+        */
         ref T require(const size_t idx, lazy T newVal = T.init) return
         {
             const pos = Position(idx);
