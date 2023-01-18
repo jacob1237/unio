@@ -108,20 +108,16 @@ public struct Table(T, size_t RowLength, Allocator)
         }
 
     public:
-        static if (isStaticAllocator)
+        this(size_t startLen)
         {
-            this(size_t startLen)
-            {
-                initialize(startLen);
-            }
+            initialize(startLen);
         }
-        else
+
+        static if (!isStaticAllocator)
+        this(Allocator allocator, size_t startLen)
         {
-            this(Allocator allocator, size_t startLen)
-            {
-                initialize(startLen);
-                alloc = allocator;
-            }
+            alloc = allocator;
+            initialize(startLen);
         }
 
         ~this() @trusted
@@ -237,7 +233,6 @@ unittest
 @("tableGrowShrink")
 @trusted unittest
 {
-    import std.experimental.allocator : allocatorObject;
     import std.experimental.allocator.mallocator : Mallocator;
     import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
 
