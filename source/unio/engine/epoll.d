@@ -448,8 +448,8 @@ public:
         this(size_t minCapacity = initialCapacity) @trusted
         {
             epoll = epoll_create1(0);
-            tasks = make!(typeof(tasks))(Mallocator.instance, minCapacity);
-            fds.initialize();
+            tasks = Mallocator.instance.make!(typeof(tasks))(minCapacity);
+            fds = typeof(fds)(initialCapacity);
         }
 
         /** 
@@ -459,7 +459,6 @@ public:
         {
             .close(epoll);
             dispose(Mallocator.instance, tasks);
-            fds.free();
         }
 
         alias List(Elem...) = Elem;

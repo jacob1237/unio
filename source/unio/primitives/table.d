@@ -37,7 +37,7 @@ import std.experimental.allocator : make, dispose, makeArray, expandArray;
 
 TODO: Idea - express data as a table of columns and rows and describe it in the doc block
  */
-public struct Table(T, size_t ChunkLength, Allocator)
+public struct Table(T, size_t RowLength, Allocator)
 {
     private:
         struct Position
@@ -47,38 +47,58 @@ public struct Table(T, size_t ChunkLength, Allocator)
 
             this(size_t idx)
             {
-                row = idx / ChunkLength;
-                col = idx % ChunkLength;
+                row = idx / RowLength;
+                col = idx % RowLength;
             }
         }
 
-        T[][] table;
+        struct Row
+        {
+            T[RowLength] data;
+            size_t length;
+        }
+
+        enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
+
+        static if (isStaticAllocator) alias alloc = Allocator.instance;
+        else Allocator alloc;
+
+        Row*[] table;
 
         T* lookup(in Position pos) pure nothrow
         {
-            return pos.row < table.length && table[pos.row] !is null ? &table[pos.row][pos.col] : null;
+            return pos.row < table.length && table[pos.row] !is null
+                ? &table[pos.row].data[pos.col]
+                : null;
         }
 
         T* insert(in Position pos, T val) @trusted
         {
-            with (pos)
+            const delta = pos.row + 1 - table.length;
+
+            if (pos.row >= table.length) {
+                assert(alloc.expandArray(table, delta), "Can't expand Table index");
+            }
+
+            if (table[pos.row] is null)
             {
-                const delta = row + 1 - table.length;
+                table[pos.row] = alloc.make!Row;
+                assert(table[pos.row], "Can't allocate Table row");
+            }
 
-                if (row >= table.length && !expandArray(Allocator.instance, table, delta)) {
-                    return null;
-                }
+            with (table[pos.row])
+            {
+                data[pos.col] = val;
+                length++;
 
-                if (table[row] is null)
-                {
-                    table[row] = makeArray!(T)(Allocator.instance, ChunkLength);
-                    if (!table[row]) return null;
-                }
+                return &data[pos.col];
+            }
+        }
 
-                auto entry = &table[row][col];
-                *entry = val;
-
-                return entry;
+        void initialize(size_t startLen) @trusted
+        {
+            if (table is null) {
+                table = alloc.makeArray!(Row*)(startLen ? startLen : RowLength);
             }
         }
 
@@ -88,20 +108,29 @@ public struct Table(T, size_t ChunkLength, Allocator)
         }
 
     public:
-        void initialize(const size_t minSize = ChunkLength) @trusted
+        static if (isStaticAllocator)
         {
-            if (table is null) {
-                table = makeArray!(T[])(Allocator.instance, minSize);
+            this(size_t startLen)
+            {
+                initialize(startLen);
+            }
+        }
+        else
+        {
+            this(Allocator allocator, size_t startLen)
+            {
+                initialize(startLen);
+                alloc = allocator;
             }
         }
 
-        void free() @trusted
+        ~this() @trusted
         {
-            if (table.length) {
-                foreach (row; table) if (row !is null) dispose(Allocator.instance, row);
-                dispose(Allocator.instance, table);
+            if (table.length)
+            {
+                foreach (row; table) if (row !is null) alloc.dispose(row);
+                alloc.dispose(table);
             }
-
         }
 
         ref T opIndexAssign(T)(T val, size_t idx) return
@@ -149,10 +178,22 @@ public struct Table(T, size_t ChunkLength, Allocator)
             return !empty(entry) ? *entry : *insert(pos, newVal);
         }
 
-        void remove(const size_t idx)
+        void remove(const size_t idx) @trusted
         {
-            auto entry = lookup(Position(idx));
-            if (!empty(entry)) *entry = T.init;
+            auto pos = Position(idx);
+
+            if (empty(lookup(pos))) return;
+
+            with (table[pos.row])
+            {
+                data[pos.col] = T.init;
+                length--;
+
+                if (length == 0) {
+                    alloc.dispose(table[pos.row]);
+                    table[pos.row] = null;
+                }
+            }
         }
 }
 
@@ -167,9 +208,7 @@ unittest
         string name;
     }
 
-    Table!(Entry, 8, Mallocator) t;
-    t.initialize();
-    scope(exit) t.free();
+    auto t = Table!(Entry, 8, Mallocator)(8);
 
     // Test not found
     assert(2 !in t);
@@ -192,4 +231,30 @@ unittest
     assert(127 in t);
     assert(128 !in t);
     assert(testEntry2 == t.take(127, (ref Entry e) => e, () => Entry.init));
+}
+
+@("tableGrowShrink")
+@trusted unittest
+{
+    import std.experimental.allocator : allocatorObject;
+    import std.experimental.allocator.mallocator : Mallocator;
+    import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
+
+    struct Alloc
+    {
+        static StatsCollector!Mallocator instance;
+        alias instance this;
+    }
+
+    alias Entry = long;
+
+    auto t = Table!(Entry, 3, Alloc)(3);
+    assert(t.table.length == 3);
+
+    t[10] = Entry(777);
+    assert(t.table.length == 4);
+
+    t.remove(10);
+    assert(t.table[3] is null);
+    assert(Alloc.instance.numDeallocate == 1);
 }
