@@ -55,7 +55,7 @@ public struct Table(T, size_t RowLength, Allocator)
         struct Row
         {
             T[RowLength] data;
-            size_t length;
+            size_t counter; // A number of non-empty elements 
         }
 
         enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
@@ -89,7 +89,7 @@ public struct Table(T, size_t RowLength, Allocator)
             with (table[pos.row])
             {
                 data[pos.col] = val;
-                length++;
+                counter++;
 
                 return &data[pos.col];
             }
@@ -187,9 +187,10 @@ public struct Table(T, size_t RowLength, Allocator)
             with (table[pos.row])
             {
                 data[pos.col] = T.init;
-                length--;
+                counter--;
 
-                if (length == 0) {
+                // Free the row memory block if there are no more elements
+                if (counter == 0) {
                     alloc.dispose(table[pos.row]);
                     table[pos.row] = null;
                 }
