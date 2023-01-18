@@ -2,8 +2,6 @@ module unio.primitives.table;
 
 @safe @nogc:
 
-import std.experimental.allocator : make, dispose, makeArray, expandArray;
-
 /** 
 The Table implements a similar interface to associative array, but instead of using
 a hash function, it maps sequential numeric keys into values pretty much like a simple array does.
@@ -24,6 +22,8 @@ TODO: Allow the RowLength to be defined at runtime (dynamically)
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
+    import std.experimental.allocator : make, dispose, makeArray, expandArray;
+
     private:
         struct Position
         {
