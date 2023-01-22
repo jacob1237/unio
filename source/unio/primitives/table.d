@@ -134,14 +134,14 @@ public struct Table(T, size_t RowLength, Allocator)
         Takes value from the array and runs a delegate on it if exists.
         If the value is not present, executes the notFound() callback
         */
-        void take(Fn)(const size_t idx, Fn found)
+        void take(Fn)(const size_t idx, scope Fn found)
         {
             auto entry = lookup(Position(idx));
             if (!empty(entry)) found(*entry);
         }
 
         /** ditto */
-        auto take(Found, NotFound)(const size_t idx, Found found, NotFound notFound)
+        auto take(Found, NotFound)(const size_t idx, scope Found found, scope NotFound notFound)
         {
             auto entry = lookup(Position(idx));
             return !empty(entry) ? found(*entry) : notFound();
