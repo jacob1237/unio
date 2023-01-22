@@ -62,14 +62,19 @@ public struct Table(T, size_t RowLength, Allocator)
         {
             const delta = pos.row + 1 - table.length;
 
-            if (pos.row >= table.length) {
-                assert(alloc.expandArray(table, delta), "Can't expand Table index");
+            if (pos.row >= table.length && !alloc.expandArray(table, delta)) {
+                assert(false, "Can't expand Table index");
             }
 
             if (table[pos.row] is null)
             {
-                table[pos.row] = alloc.make!Row;
-                assert(table[pos.row], "Can't allocate Table row");
+                auto ptr = alloc.make!Row;
+
+                if (ptr is null) {
+                    assert(false, "Can't allocate Table row");
+                }
+
+                table[pos.row] = ptr;
             }
 
             with (table[pos.row])
