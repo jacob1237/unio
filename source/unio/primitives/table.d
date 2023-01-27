@@ -15,11 +15,9 @@ However, there are key differences:
 4. Implements both hashmap and Option-like interface, allowing to work with empty values
 
 TODO: Introduce an appropriate growth strategy for the index array (growth factor?)
-TODO: Automatically shrink the index array when it becomes partially empty
 TODO: Use the custom FreeList allocator on top of the Allocator internally to prevent performance issues
 TODO: Write proper unit tests for each Table method and a couple of functional tests
 TODO: Allow the RowLength to be defined at runtime (dynamically)
-TODO: Add user-defined empty/null checks to the element types instead of comparing with T.init
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
