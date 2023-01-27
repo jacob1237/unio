@@ -40,8 +40,41 @@ public struct Table(T, size_t RowLength, Allocator)
 
         struct Row
         {
+            import core.bitop : bt, bts, btr;
+
+            size_t counter; // A number of non-empty elements
+            ubyte[RowLength / 8] index; // A bitset for null checks
             T[RowLength] data;
-            size_t counter; // A number of non-empty elements 
+
+            T* opIndex()(size_t col) pure nothrow
+            {
+                return &data[col];
+            }
+
+            T* opIndexAssign(T)(scope ref T val, size_t col) pure nothrow @trusted
+            {
+                bts(cast(ulong*) index, col);
+                data[col] = val;
+                counter++;
+
+                return &data[col];
+            }
+
+            void remove(const size_t col) pure nothrow @trusted
+            {
+                btr(cast(ulong*) index, col);
+                counter--;
+            }
+
+            bool opBinaryRight(string op : "in")(size_t col) pure nothrow @trusted
+            {
+                return cast(bool) bt(cast(ulong*) index, col);
+            }
+
+            bool empty() pure nothrow
+            {
+                return counter == 0;
+            }
         }
 
         enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
@@ -53,8 +86,8 @@ public struct Table(T, size_t RowLength, Allocator)
 
         T* lookup(in Position pos) pure nothrow
         {
-            return pos.row < table.length && table[pos.row] !is null
-                ? &table[pos.row].data[pos.col]
+            with (pos) return row < table.length && table[row] !is null && col in *table[row]
+                ? (*table[row])[col]
                 : null;
         }
 
@@ -77,13 +110,7 @@ public struct Table(T, size_t RowLength, Allocator)
                 table[pos.row] = ptr;
             }
 
-            with (table[pos.row])
-            {
-                data[pos.col] = val;
-                counter++;
-
-                return &data[pos.col];
-            }
+            return (*table[pos.row])[pos.col] = val;
         }
 
         void initialize(size_t startLen) @trusted
@@ -91,11 +118,6 @@ public struct Table(T, size_t RowLength, Allocator)
             if (table is null) {
                 table = alloc.makeArray!(Row*)(startLen ? startLen : RowLength);
             }
-        }
-
-        static bool empty(in T* entry) pure nothrow
-        {
-            return entry is null || *entry == T.init;
         }
 
     public:
@@ -127,7 +149,7 @@ public struct Table(T, size_t RowLength, Allocator)
 
         bool opBinaryRight(string op : "in")(size_t idx) pure nothrow
         {
-            return !empty(lookup(Position(idx)));
+            return cast(bool) lookup(Position(idx));
         }
 
         /** 
@@ -137,14 +159,14 @@ public struct Table(T, size_t RowLength, Allocator)
         void take(Fn)(const size_t idx, scope Fn found)
         {
             auto entry = lookup(Position(idx));
-            if (!empty(entry)) found(*entry);
+            if (entry !is null) found(*entry);
         }
 
         /** ditto */
         auto take(Found, NotFound)(const size_t idx, scope Found found, scope NotFound notFound)
         {
             auto entry = lookup(Position(idx));
-            return !empty(entry) ? found(*entry) : notFound();
+            return entry !is null ? found(*entry) : notFound();
         }
 
         /** 
@@ -162,25 +184,21 @@ public struct Table(T, size_t RowLength, Allocator)
             const pos = Position(idx);
             auto entry = lookup(pos);
 
-            return !empty(entry) ? *entry : *insert(pos, newVal);
+            return entry !is null ? *entry : *insert(pos, newVal);
         }
 
         void remove(const size_t idx) @trusted
         {
             auto pos = Position(idx);
+            if (!lookup(pos)) return;
 
-            if (empty(lookup(pos))) return;
+            auto row = table[pos.row];
+            row.remove(pos.col);
 
-            with (table[pos.row])
+            if (row.empty)
             {
-                data[pos.col] = T.init;
-                counter--;
-
-                // Free the row memory block if there are no more elements
-                if (counter == 0) {
-                    alloc.dispose(table[pos.row]);
-                    table[pos.row] = null;
-                }
+                alloc.dispose(table[pos.row]);
+                table[pos.row] = null;
             }
         }
 }
@@ -222,7 +240,7 @@ unittest
 }
 
 @("tableGrowShrink")
-@trusted unittest
+unittest
 {
     import std.experimental.allocator.mallocator : Mallocator;
     import std.experimental.allocator.building_blocks.stats_collector : StatsCollector, Options;
