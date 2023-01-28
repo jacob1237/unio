@@ -20,6 +20,7 @@ TODO: Allow the RowLength to be defined at runtime (dynamically)
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
+    import core.checkedint : addu, mulu;
     import std.algorithm.comparison : max;
     import std.experimental.allocator : make, dispose, makeArray, expandArray;
 
@@ -104,14 +105,20 @@ public struct Table(T, size_t RowLength, Allocator)
         /** 
         When the requested row is beyond the growth factor values, the table index
         is extended just up to that row, otherwise, the length grows twice its size
-
-        TODO: Check for integer overflows (not realistic right now)
         */
         void ensureTableLen(const size_t row) @trusted
         {
             if (row < table.length) return;
 
-            auto delta = max(row + 1, table.length * 2) - table.length;
+            bool overflow;
+
+            auto growthLen = mulu(table.length, 2, overflow);
+            if (overflow) assert(false, "Table length overflow");
+
+            auto targetLen = addu(row, 1, overflow);
+            if (overflow) assert(false, "Table length overflow");
+
+            auto delta = max(growthLen, targetLen) - table.length;
             auto ret = alloc.expandArray(table, delta);
 
             if (!ret) assert(false, "Can't expand Table index");
