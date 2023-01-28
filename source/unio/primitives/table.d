@@ -14,13 +14,13 @@ However, there are key differences:
 3. The chunk is freed automatically when becomes empty
 4. Implements both hashmap and Option-like interface, allowing to work with empty values
 
-TODO: Introduce an appropriate growth strategy for the index array (growth factor?)
 TODO: Use the custom FreeList allocator on top of the Allocator internally to prevent performance issues
 TODO: Write proper unit tests for each Table method and a couple of functional tests
 TODO: Allow the RowLength to be defined at runtime (dynamically)
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
+    import std.algorithm.comparison : max;
     import std.experimental.allocator : make, dispose, makeArray, expandArray;
 
     private:
@@ -84,31 +84,50 @@ public struct Table(T, size_t RowLength, Allocator)
 
         T* lookup(in Position pos) pure nothrow
         {
-            with (pos) return row < table.length && table[row] !is null && col in *table[row]
+            with (pos)
+            return row < table.length && table[row] !is null && col in *table[row]
                 ? (*table[row])[col]
                 : null;
         }
 
-        T* insert(in Position pos, T val) @trusted
+        T* insert(in Position pos, T val)
         {
-            const delta = pos.row + 1 - table.length;
-
-            if (pos.row >= table.length && !alloc.expandArray(table, delta)) {
-                assert(false, "Can't expand Table index");
-            }
-
-            if (table[pos.row] is null)
+            with (pos)
             {
-                auto ptr = alloc.make!Row;
+                ensureTableLen(row);
+                ensureRowExists(row);
 
-                if (ptr is null) {
-                    assert(false, "Can't allocate Table row");
-                }
-
-                table[pos.row] = ptr;
+                return (*table[row])[col] = val;
             }
+        }
 
-            return (*table[pos.row])[pos.col] = val;
+        /** 
+        When the requested row is beyond the growth factor values, the table index
+        is extended just up to that row, otherwise, the length grows twice its size
+
+        TODO: Check for integer overflows (not realistic right now)
+        */
+        void ensureTableLen(const size_t row) @trusted
+        {
+            if (row < table.length) return;
+
+            auto delta = max(row + 1, table.length * 2) - table.length;
+            auto ret = alloc.expandArray(table, delta);
+
+            if (!ret) assert(false, "Can't expand Table index");
+        }
+
+        /**
+        Ensure that the memory for the given row is allocated and ready for use
+        */
+        void ensureRowExists(const size_t row) @trusted
+        {
+            if (table[row] !is null) return;
+
+            auto ptr = alloc.make!Row;
+            if (ptr is null) assert(false, "Can't allocate Table row");
+
+            table[row] = ptr;
         }
 
         void initialize(size_t startLen) @trusted
@@ -119,6 +138,8 @@ public struct Table(T, size_t RowLength, Allocator)
         }
 
     public:
+        @disable this(this);
+
         this(size_t startLen)
         {
             initialize(startLen);
@@ -185,6 +206,10 @@ public struct Table(T, size_t RowLength, Allocator)
             return entry !is null ? *entry : *insert(pos, newVal);
         }
 
+        /**
+        Removes an element by the index
+        When all indexes of the same row are empty, the row will be freed automatically
+        */
         void remove(const size_t idx) @trusted
         {
             auto pos = Position(idx);
