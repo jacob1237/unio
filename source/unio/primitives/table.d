@@ -287,7 +287,9 @@ unittest
     assert(t.table.length == 3);
 
     t[10] = Entry(777);
-    assert(t.table.length == 4);
+
+    // Check in accordance with the growth factor (length x 2)
+    assert(t.table.length == 6);
 
     t.remove(10);
     assert(t.table[3] is null);
