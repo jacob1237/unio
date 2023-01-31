@@ -20,15 +20,16 @@ TODO: Allow the RowLength to be defined at runtime (dynamically)
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
-    import core.checkedint : addu, mulu;
-    import std.algorithm.comparison : max;
-    import std.experimental.allocator : make, dispose, makeArray, expandArray;
+    import core.checkedint : mulu;
+    import core.stdc.string : memset;
 
     private:
         struct Position
         {
             size_t row;
             size_t col;
+
+            @disable this();
 
             this(size_t idx)
             {
@@ -108,20 +109,24 @@ public struct Table(T, size_t RowLength, Allocator)
         */
         void ensureTableLen(const size_t row) @trusted
         {
+            import std.algorithm.comparison : max;
+
             if (row < table.length) return;
 
+            auto mem = cast(void[]) table;
             bool overflow;
 
-            auto growthLen = mulu(table.length, 2, overflow);
+            auto oldSize = mem.length;
+            auto newSize = mulu(max(table.length << 1, row + 1), (Row*).sizeof, overflow);
+
             if (overflow) assert(false, "Table length overflow");
+            if (!alloc.reallocate(mem, newSize)) assert(false, "Can't expand Table index");
 
-            auto targetLen = addu(row, 1, overflow);
-            if (overflow) assert(false, "Table length overflow");
+            // Initialize newly allocated memory
+            auto newMem = mem[oldSize .. $];
+            memset(newMem.ptr, 0, newMem.length);
 
-            auto delta = max(growthLen, targetLen) - table.length;
-            auto ret = alloc.expandArray(table, delta);
-
-            if (!ret) assert(false, "Can't expand Table index");
+            table = cast(typeof(table)) mem;
         }
 
         /**
@@ -131,16 +136,32 @@ public struct Table(T, size_t RowLength, Allocator)
         {
             if (table[row] !is null) return;
 
-            auto ptr = alloc.make!Row;
-            if (ptr is null) assert(false, "Can't allocate Table row");
+            auto addr = alloc.allocate(Row.sizeof);
+            if (addr is null) assert(false, "Can't allocate Table row");
 
-            table[row] = ptr;
+            auto rowPtr = cast(Row*) addr.ptr;
+
+            // Initialize the bitset and counter to all zeroes
+            memset(&rowPtr.index, 0, Row.index.sizeof);
+            rowPtr.counter = 0;
+
+            table[row] = rowPtr;
         }
 
         void initialize(size_t startLen) @trusted
         {
-            if (table is null) {
-                table = alloc.makeArray!(Row*)(startLen ? startLen : RowLength);
+            if (table is null)
+            {
+                bool overflow;
+
+                auto size = mulu(startLen ? startLen : RowLength, (Row*).sizeof, overflow);
+                if (overflow) assert(false, "Table length overflow");
+
+                auto addr = alloc.allocate(size);
+                if (addr is null) assert(false, "Can't allocate Table");
+
+                memset(addr.ptr, 0, size);
+                table = cast(typeof(table)) addr;
             }
         }
 
@@ -161,11 +182,14 @@ public struct Table(T, size_t RowLength, Allocator)
 
         ~this() @trusted
         {
-            if (table.length)
-            {
-                foreach (row; table) if (row !is null) alloc.dispose(row);
-                alloc.dispose(table);
+            if (!table.length) return;
+
+            foreach (row; table) {
+                if (row !is null) alloc.deallocate(row[0 .. Row.sizeof]);
             }
+
+            alloc.deallocate(cast(void[]) table);
+            table = null;
         }
 
         ref T opIndexAssign(T)(T val, size_t idx) return
@@ -215,7 +239,7 @@ public struct Table(T, size_t RowLength, Allocator)
 
         /**
         Removes an element by the index
-        When all indexes of the same row are empty, the row will be freed automatically
+        When all indexes of the same row are empty, the row is freed automatically
         */
         void remove(const size_t idx) @trusted
         {
@@ -227,7 +251,7 @@ public struct Table(T, size_t RowLength, Allocator)
 
             if (row.empty)
             {
-                alloc.dispose(table[pos.row]);
+                alloc.deallocate((cast(void*) table[pos.row])[0 .. Row.sizeof]);
                 table[pos.row] = null;
             }
         }
