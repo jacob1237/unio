@@ -1,6 +1,6 @@
 module unio.primitives.pool;
 
-@safe:
+@safe @nogc:
 
 public enum isPool(T) = 
     is(T.length == size_t) &&
@@ -182,20 +182,18 @@ public struct ArrayPool(T, Allocator)
 
 version(unittest)
 {
+    import std.experimental.allocator.mallocator : TestAlloc = Mallocator;
+
     struct User
     {
         size_t id;
         string name;
     }
-
-    import std.experimental.allocator.mallocator : TestAlloc = Mallocator;
 }
 
 @("poolOpIn")
 unittest
 {
-    import std.experimental.allocator.mallocator;
-
     auto p = ArrayPool!(User, TestAlloc)(2);
     assert(1 !in p);
     assert(2 !in p);
