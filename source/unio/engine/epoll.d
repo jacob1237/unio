@@ -8,10 +8,13 @@ private:
     import core.stdc.errno;
     import core.sys.posix.netinet.in_;
     import core.sys.posix.unistd;
+    import std.experimental.allocator.mallocator : Mallocator;
     import unio.primitives;
 
     enum SOCK_NONBLOCK = 0x800;
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
+
+    alias Key = ArrayPool!(Task, Mallocator).Key;
 
     /** 
      * Operation type enum.
@@ -74,7 +77,7 @@ private:
         OpType type;
         Status.Type status;
         Data data;
-        size_t next;
+        Key next;
         long result;
 
         // Params
@@ -134,7 +137,6 @@ public:
      * TODO: Add support for async file operations (via AIO/io_submit or a dedicated thread pool)
      * TODO: Handle connection errors both for read/write operations
      * TODO: Rename read/write task types to input/output
-     * TODO: Make task containers more flexible and efficient
      * TODO: Edge case: epoll may notify readiness for send(), but EAGAIN will be returned: https://habr.com/ru/post/416669/#comment_18865881
      * TODO: Handle SIGPIPE correctly when using `write()`: https://stackoverflow.com/a/18963142/7695184
      * TODO: Handle setsockopt() `SO_RCVTIMEO` and `SO_SNDTIMEO` (check how do they react)
@@ -147,9 +149,6 @@ public:
         import core.sys.posix.arpa.inet;
         import core.sys.posix.sys.socket;
         import core.time : Duration, msecs;
-
-        import std.experimental.allocator : make, dispose;
-        import std.experimental.allocator.mallocator : Mallocator;
 
         enum maxEvents = 256;
         enum queueSize = 1024;
@@ -168,7 +167,7 @@ public:
          * Queue-related
          */
         Table!(FDInfo, initialCapacity, Mallocator) fds;
-        FreeList!(Task, Mallocator) tasks;
+        ArrayPool!(Task, Mallocator) tasks;
 
         // Run queue
         RingBuffer!(Key, queueSize) runQueue;
@@ -319,11 +318,10 @@ public:
             for (; !runQueue.empty; runQueue.popFront())
             {
                 auto taskId = runQueue.front;
-                auto task = tasks.get(taskId);
 
-                if (!task.isNull) {
-                    fds.take(task.data.fd, (ref FDInfo fdi) => runTask(fdi, task, taskId));
-                }
+                tasks.take(taskId, (ref Task task) =>
+                    fds.take(task.data.fd, (ref FDInfo fdi) =>
+                        runTask(fdi, task, taskId)));
             }
         }
 
@@ -356,9 +354,8 @@ public:
         /** 
          * Submit the task to the execution pipeline
          */
-        IO scheduleTask(const Key taskId) @trusted
+        IO scheduleTask(const Key taskId, ref Task task) @trusted
         {
-            auto task = tasks.get(taskId);
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
@@ -386,12 +383,10 @@ public:
                     }
                     else
                     {
-                        auto lastTask = tasks.get(tail);
-
-                        if (!lastTask.isNull) {
+                        tasks.take(tail, (ref Task lastTask) {
                             lastTask.next = taskId;
                             tail = taskId;
-                        }
+                        });
                     }
                 }
             }
@@ -426,7 +421,7 @@ public:
                                 ev.events & EPOLLERR ? Pipeline.State.error :
                                 ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                            if (tasks.has(fdi.read.head)) runQueue.put(fdi.read.head);
+                            if (fdi.read.head in tasks) runQueue.put(fdi.read.head);
                         }
 
                         // TODO: Handle partially-completed write operations (and retries in case of EINTR)
@@ -436,7 +431,7 @@ public:
                                 ev.events & EPOLLERR ? Pipeline.State.error :
                                 ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                            if (tasks.has(fdi.write.head)) runQueue.put(fdi.write.head);
+                            if (fdi.write.head in tasks) runQueue.put(fdi.write.head);
                         }
                     },
                     () @trusted { epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null); }
@@ -448,7 +443,7 @@ public:
         this(size_t minCapacity = initialCapacity) @trusted
         {
             epoll = epoll_create1(0);
-            tasks = Mallocator.instance.make!(typeof(tasks))(minCapacity);
+            tasks = typeof(tasks)(minCapacity);
             fds = typeof(fds)(initialCapacity);
         }
 
@@ -458,7 +453,6 @@ public:
         ~this() @trusted
         {
             .close(epoll);
-            dispose(Mallocator.instance, tasks);
         }
 
         alias List(Elem...) = Elem;
@@ -467,8 +461,14 @@ public:
         {
             IO submit(T op)
             {
-                auto taskId = tasks.add(toTask(op));
-                return scheduleTask(taskId);
+                auto taskId = tasks.put(toTask(op));
+
+                // TODO: Check for pool errors when inserting
+                return tasks.take(
+                    taskId,
+                    (ref Task task) => scheduleTask(taskId, task),
+                    () => IO(0)
+                );
             }
         }
 
@@ -479,7 +479,7 @@ public:
          */
         bool cancel(IO op)
         {
-            tasks.remove(Key(op));
+            tasks.remove(Key(cast(Key) op));
             return true;
         }
 
