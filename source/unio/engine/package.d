@@ -87,7 +87,11 @@ public:
     }
 
     /** 
-    * TODO: add IO priority support
+    TODO: Add IO priority support
+    TODO: Add operation chaining
+    TODO: Add proper fd create and register/unregister functions (socket, fd)
+    TODO: Add buffer support (register buffers)
+    TODO: Unify operation types and make a single `submit` entry point
     */
     interface IOEngine
     {
