@@ -17,6 +17,7 @@ All objects/values are only accesible via `take()`, which prevents pointers esca
 Also, the values are nullable by default, so the end user doesn't have to care about it.
 
 TODO: Add support for auto-shrink after certain threshold
+TODO: Define invalid Key value for additional checks
 */
 public struct ArrayPool(T, Allocator)
 {
@@ -77,6 +78,8 @@ public struct ArrayPool(T, Allocator)
         */
         void resize(size_t len) @trusted
         {
+            if (len == data.length) return;
+
             bool overflow;
             const size = mulu(len, Slot.sizeof, overflow);
             if (overflow) assert(false, "ArrayPool length overflow");
@@ -129,6 +132,8 @@ public struct ArrayPool(T, Allocator)
 
         bool opBinaryRight(string op : "in")(Key key) const
         {
+            if (key == 0) return false;
+
             const idx = key - 1;
             return capacity > idx && !data[idx].entry.isNull;
         }
@@ -195,6 +200,7 @@ version(unittest)
 unittest
 {
     auto p = ArrayPool!(User, TestAlloc)(2);
+    assert(0 !in p);
     assert(1 !in p);
     assert(2 !in p);
     assert(3 !in p);
