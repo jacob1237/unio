@@ -22,8 +22,8 @@ public struct Table(T, size_t RowLength, Allocator)
 {
     import core.checkedint : mulu;
     import core.stdc.string : memset;
+    import unio.primitives.array;
 
-    public enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
     public enum minTableLen = 1;
 
     private:
@@ -80,10 +80,7 @@ public struct Table(T, size_t RowLength, Allocator)
             }
         }
 
-        static if (isStaticAllocator) alias alloc = Allocator.instance;
-        else Allocator alloc;
-
-        Row*[] table;
+        Array!(Row*, Allocator) table;
         size_t tableStartLen;
 
         T* lookup(in Position pos) pure nothrow
@@ -94,11 +91,21 @@ public struct Table(T, size_t RowLength, Allocator)
                 : null;
         }
 
+        /**
+        Insert element at the specific position.
+
+        When the requested row is beyond the growth factor values, the table index
+        is extended just up to that row, otherwise, the length grows twice its size.
+
+        If the row doesn't exist, it will be allocated.
+        */
         T* insert(in Position pos, T val)
         {
+            import std.algorithm.comparison : max;
+
             with (pos)
             {
-                if (row >= table.length) growTable(row);
+                if (row >= table.length) table.resize(max(table.length << 1, row + 1));
                 if (table[row] is null) makeRow(row);
 
                 return (*table[row])[col] = val;
@@ -106,45 +113,11 @@ public struct Table(T, size_t RowLength, Allocator)
         }
 
         /**
-        Grow table up to a specific row index
-
-        When the requested row is beyond the growth factor values, the table index
-        is extended just up to that row, otherwise, the length grows twice its size
-        */
-        void growTable(const size_t row) @trusted
-        {
-            import std.algorithm.comparison : max;
-
-            const oldLen = table.length;
-            resizeTable(max(table.length << 1, row + 1));
-
-            // Zero-initialize the extended memory block
-            auto mem = cast(void[]) table[oldLen .. $];
-            memset(mem.ptr, 0, mem.length);
-        }
-
-        /**
-        Resize (grow or shrink) the table index
-        */
-        void resizeTable(const size_t newLen) @trusted
-        {
-            auto mem = cast(void[]) table;
-
-            bool overflow;
-            const newSize = mulu(newLen, (Row*).sizeof, overflow);
-
-            if (overflow) assert(false, "Table length overflow");
-            if (!alloc.reallocate(mem, newSize)) assert(false, "Can't resize Table index");
-
-            table = cast(typeof(table)) mem;
-        }
-
-        /**
         Allocate new row for a particular index
         */
         void makeRow(const size_t row) @trusted
         {
-            auto addr = alloc.allocate(Row.sizeof);
+            auto addr = table.alloc.allocate(Row.sizeof);
             if (addr is null) assert(false, "Can't allocate Table row");
 
             auto rowPtr = cast(Row*) addr.ptr;
@@ -156,12 +129,12 @@ public struct Table(T, size_t RowLength, Allocator)
         /**
         Deallocate a particular range of rows and nullify the pointers
         */
-        void removeRow(typeof(table) slice) @trusted
+        void removeRow(Row*[] slice) @trusted
         {
             foreach (ref row; slice)
             {
                 if (row !is null) {
-                    alloc.deallocate(row[0 .. Row.sizeof]);
+                    table.alloc.deallocate(row[0 .. Row.sizeof]);
                     row = null;
                 }
             }
@@ -178,19 +151,7 @@ public struct Table(T, size_t RowLength, Allocator)
 
         void initialize(size_t startLen) @trusted
         {
-            if (table !is null) return;
-
             tableStartLen = startLen < minTableLen ? minTableLen : startLen;
-
-            bool overflow;
-            auto size = mulu(tableStartLen, (Row*).sizeof, overflow);
-            if (overflow) assert(false, "Table length overflow");
-
-            auto addr = alloc.allocate(size);
-            if (addr is null) assert(false, "Can't allocate Table");
-
-            memset(addr.ptr, 0, size);
-            table = cast(typeof(table)) addr;
         }
 
     public:
@@ -200,25 +161,25 @@ public struct Table(T, size_t RowLength, Allocator)
         Params:
           startLen = Initial row index size
         */
-        this(const size_t startLen)
+        this(size_t startLen)
         {
             initialize(startLen);
+            table = typeof(table)(tableStartLen);
         }
 
-        static if (!isStaticAllocator)
-        this(Allocator allocator, const size_t startLen)
+        static if (!table.isStaticAllocator)
+        this(Allocator allocator, size_t startLen)
         {
-            alloc = allocator;
             initialize(startLen);
+            table = typeof(table)(alloc, tableStartLen);
         }
 
         ~this() @trusted
         {
             if (table.length)
             {
-                removeRow(table);
-                alloc.deallocate(cast(void[]) table);
-                table = null;
+                removeRow(table[]);
+                table.destroy();
             }
         }
 
@@ -287,12 +248,13 @@ public struct Table(T, size_t RowLength, Allocator)
         */
         void reset()
         {
-            if (table.length)
-            {
-                removeRow(table[1 .. $]);
-                resetRow(*table[0]);
-                resizeTable(tableStartLen);
-            }
+            if (!table.length) return;
+
+            removeRow(table[1 .. $]);
+            resetRow(*table[0]);
+
+            table.resize(tableStartLen);
+            table[0 .. $] = null;
         }
 }
 
