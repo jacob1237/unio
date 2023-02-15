@@ -49,6 +49,11 @@ public struct Table(T, size_t RowLength, Allocator)
             ubyte[RowLength / 8] index; // A bitset for null checks
             T[RowLength] data;
 
+            @property bool empty() const pure nothrow
+            {
+                return counter == 0;
+            }
+
             T* opIndex()(size_t col) pure nothrow
             {
                 return &data[col];
@@ -72,11 +77,6 @@ public struct Table(T, size_t RowLength, Allocator)
             bool opBinaryRight(string op : "in")(size_t col) pure nothrow @trusted
             {
                 return cast(bool) bt(cast(ulong*) index, col);
-            }
-
-            bool empty() pure nothrow
-            {
-                return counter == 0;
             }
         }
 
@@ -149,7 +149,7 @@ public struct Table(T, size_t RowLength, Allocator)
             row.counter = 0;
         }
 
-        void initialize(size_t startLen) @trusted
+        void initialize(size_t startLen)
         {
             tableStartLen = startLen < minTableLen ? minTableLen : startLen;
         }
