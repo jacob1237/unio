@@ -22,8 +22,9 @@ public struct Table(T, size_t RowLength, Allocator)
 {
     import core.checkedint : mulu;
     import core.stdc.string : memset;
-    import unio.primitives.array;
+    import unio.primitives.allocator : makeArray, resizeArray;
 
+    public enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
     public enum minTableLen = 1;
 
     private:
@@ -80,8 +81,11 @@ public struct Table(T, size_t RowLength, Allocator)
             }
         }
 
-        Array!(Row*, Allocator) table;
+        Row*[] table;
         size_t tableStartLen;
+
+        static if (isStaticAllocator) alias alloc = Allocator.instance;
+        else Allocator alloc;
 
         T* lookup(in Position pos) pure nothrow
         {
@@ -105,7 +109,7 @@ public struct Table(T, size_t RowLength, Allocator)
 
             with (pos)
             {
-                if (row >= table.length) table.resize(max(table.length << 1, row + 1));
+                if (row >= table.length) alloc.resizeArray(table, max(table.length << 1, row + 1));
                 if (table[row] is null) makeRow(row);
 
                 return (*table[row])[col] = val;
@@ -117,7 +121,7 @@ public struct Table(T, size_t RowLength, Allocator)
         */
         void makeRow(const size_t row) @trusted
         {
-            auto addr = table.alloc.allocate(Row.sizeof);
+            auto addr = alloc.allocate(Row.sizeof);
             if (addr is null) assert(false, "Can't allocate Table row");
 
             auto rowPtr = cast(Row*) addr.ptr;
@@ -134,7 +138,7 @@ public struct Table(T, size_t RowLength, Allocator)
             foreach (ref row; slice)
             {
                 if (row !is null) {
-                    table.alloc.deallocate(row[0 .. Row.sizeof]);
+                    alloc.deallocate(row[0 .. Row.sizeof]);
                     row = null;
                 }
             }
@@ -152,6 +156,7 @@ public struct Table(T, size_t RowLength, Allocator)
         void initialize(size_t startLen)
         {
             tableStartLen = startLen < minTableLen ? minTableLen : startLen;
+            table = alloc.makeArray!(Row*)(tableStartLen);
         }
 
     public:
@@ -164,14 +169,13 @@ public struct Table(T, size_t RowLength, Allocator)
         this(size_t startLen)
         {
             initialize(startLen);
-            table = typeof(table)(tableStartLen);
         }
 
-        static if (!table.isStaticAllocator)
+        static if (!isStaticAllocator)
         this(Allocator allocator, size_t startLen)
         {
+            alloc = allocator;
             initialize(startLen);
-            table = typeof(table)(alloc, tableStartLen);
         }
 
         ~this() @trusted
@@ -179,7 +183,7 @@ public struct Table(T, size_t RowLength, Allocator)
             if (table.length)
             {
                 removeRow(table[]);
-                table.destroy();
+                alloc.deallocate(table);
             }
         }
 
@@ -253,7 +257,7 @@ public struct Table(T, size_t RowLength, Allocator)
             removeRow(table[1 .. $]);
             resetRow(*table[0]);
 
-            table.resize(tableStartLen);
+            alloc.resizeArray(table, tableStartLen);
             table[0 .. $] = null;
         }
 }
