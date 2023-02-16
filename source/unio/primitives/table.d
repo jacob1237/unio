@@ -20,7 +20,6 @@ TODO: Allow the RowLength to be defined at runtime (dynamically)
 */
 public struct Table(T, size_t RowLength, Allocator)
 {
-    import core.checkedint : mulu;
     import core.stdc.string : memset;
     import unio.primitives.allocator : makeArray, resizeArray;
 
