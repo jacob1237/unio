@@ -153,7 +153,6 @@ public template BinaryHeap(Store)
 
             store.swapAt(idx, store.length - 1);
             store.removeBack();
-
             store.siftUp(store.siftDown(idx));
         }
 }
