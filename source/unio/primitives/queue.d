@@ -88,7 +88,7 @@ Caveats:
 
 TODO: Auto-shrink the container array after certain removal threshold
 */
-public struct BinaryHeap(Store)
+public template BinaryHeap(Store)
 {
     import unio.primitives.allocator : makeArray, resizeArray;
 
@@ -96,10 +96,7 @@ public struct BinaryHeap(Store)
     alias T = typeof(Store.front);
 
     private:
-        size_t _length;
-        Store* store;
-
-        size_t siftUp(size_t idx)
+        size_t siftUp(ref Store store, size_t idx)
         {
             auto child = idx;
 
@@ -114,7 +111,7 @@ public struct BinaryHeap(Store)
             return child;
         }
 
-        size_t siftDown(size_t idx)
+        size_t siftDown(ref Store store, size_t idx)
         {
             auto parent = idx;
 
@@ -122,10 +119,10 @@ public struct BinaryHeap(Store)
             {
                 child = (parent + 1) * 2;
 
-                if (child >= length)
+                if (child >= store.length)
                 {
                     // Leftover left node
-                    if (child == length)
+                    if (child == store.length)
                     {
                         store.swapAt(parent, --child);
                         parent = child;
@@ -144,63 +141,51 @@ public struct BinaryHeap(Store)
         }
 
     public:
-        @disable this(this);
-
-        this(ref Store s) @trusted
-        {
-            store = &s;
-        }
-
-        @property
-        {
-            auto length() const { return store.length; }
-            bool empty() const { return length == 0; }
-            auto front() { return store.front; }
-        }
-
-        void popFront()
-        {
-            remove(0);
-        }
-
-        size_t put(in T entry)
+        size_t insert(ref Store store, in T entry)
         {
             store.insertBack(entry);
-            return siftUp(length - 1);
+            return store.siftUp(store.length - 1);
         }
 
-        void remove(size_t idx)
+        void remove(ref Store store, size_t idx)
         {
-            if (empty || idx >= length) return;
+            if (store.empty || store.length <= idx) return;
 
-            store.swapAt(idx, length - 1);
+            store.swapAt(idx, store.length - 1);
             store.removeBack();
 
-            siftUp(siftDown(idx));
+            store.siftUp(store.siftDown(idx));
         }
 }
 
 @("heapTest")
 unittest
 {
-    struct Store(T, size_t Length)
+    struct PriorityQueue(T, size_t Length)
     {
         import std.algorithm.mutation : swapAt;
 
-        T[Length] data;
-        size_t head;
+        alias MinHeap = BinaryHeap!(typeof(this));
 
-        @property auto front() { return data[0]; }
-        @property auto length() const { return head; }
-        int compareAt(size_t l, size_t r) { return data[l] > data[r]; }
-        void swapAt(size_t l, size_t r) { data.swapAt(l, r); }
-        void insertBack(T val) { data[head++] = val; }
-        void removeBack() { head--; }
+        private:
+            T[Length] data;
+            size_t head;
+
+            int compareAt(size_t l, size_t r) { return data[l] > data[r]; }
+            void swapAt(size_t l, size_t r) { data.swapAt(l, r); }
+            void insertBack(T val) { data[head++] = val; }
+            void removeBack() { head--; }
+
+        public:
+            @property auto front() { return data[0]; }
+            @property bool empty() const { return !head; }
+            @property auto length() const { return head; }
+            void popFront() { MinHeap.remove(this, 0); }
+            size_t put(in T val) { return MinHeap.insert(this, val); }
+            void remove(size_t idx) { MinHeap.remove(this, idx); }
     }
 
-    Store!(int, 10) arr;
-
-    with (BinaryHeap!(typeof(arr))(arr))
+    with (PriorityQueue!(int, 10)())
     {
         static immutable values = [20, 21, 1, 100, 35];
 
