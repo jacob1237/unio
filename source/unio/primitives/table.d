@@ -21,9 +21,8 @@ TODO: Allow the RowLength to be defined at runtime (dynamically)
 public struct Table(T, size_t RowLength, Allocator)
 {
     import core.stdc.string : memset;
-    import unio.primitives.allocator : makeArray, resizeArray;
+    import unio.primitives.allocator : makeArray, resizeArray, isStaticAllocator;
 
-    public enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
     public enum minTableLen = 1;
 
     private:
@@ -83,7 +82,7 @@ public struct Table(T, size_t RowLength, Allocator)
         Row*[] table;
         size_t tableStartLen;
 
-        static if (isStaticAllocator) alias alloc = Allocator.instance;
+        static if (isStaticAllocator!Allocator) alias alloc = Allocator.instance;
         else Allocator alloc;
 
         T* lookup(in Position pos) pure nothrow
@@ -170,7 +169,7 @@ public struct Table(T, size_t RowLength, Allocator)
             initialize(startLen);
         }
 
-        static if (!isStaticAllocator)
+        static if (!isStaticAllocator!Allocator)
         this(Allocator allocator, size_t startLen)
         {
             alloc = allocator;

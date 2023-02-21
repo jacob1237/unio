@@ -24,12 +24,12 @@ public struct ArrayPool(T, Allocator)
     import core.checkedint : mulu;
     import core.stdc.string : memset;
     import std.typecons : Nullable, nullable;
+    import unio.primitives.allocator : isStaticAllocator;
 
     public alias Key = uint;
 
     private:
         enum minCapacity = 1;
-        enum isStaticAllocator = __traits(hasMember, Allocator, "instance");
 
         struct Slot
         {
@@ -37,7 +37,7 @@ public struct ArrayPool(T, Allocator)
             Key next;
         }
 
-        static if (isStaticAllocator) alias alloc = Allocator.instance;
+        static if (isStaticAllocator!Allocator) alias alloc = Allocator.instance;
         else Allocator alloc;
 
         size_t _length;
@@ -110,7 +110,7 @@ public struct ArrayPool(T, Allocator)
             initialize(capacity);
         }
 
-        static if (!isStaticAllocator)
+        static if (!isStaticAllocator!Allocator)
         this(Allocator allocator, size_t capacity)
         {
             alloc = allocator;

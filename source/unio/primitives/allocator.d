@@ -3,6 +3,8 @@ module unio.primitives.allocator;
 private import core.checkedint : mulu;
 private import core.stdc.string : memset;
 
+enum isStaticAllocator(Allocator) = __traits(hasMember, Allocator, "instance");
+
 /**
 Allocates array of the specific length and zero-initializes it if required.
 */
