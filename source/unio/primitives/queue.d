@@ -90,15 +90,13 @@ TODO: Auto-shrink the container array after certain removal threshold
 */
 public template BinaryHeap(Store)
 {
-    import unio.primitives.allocator : makeArray, resizeArray;
-
     // Element type of the Store
     alias T = typeof(Store.front);
 
     private:
         size_t siftUp(ref Store store, size_t idx)
         {
-            auto child = idx;
+            size_t child = idx;
 
             for (size_t parent; child; child = parent)
             {
@@ -144,7 +142,7 @@ public template BinaryHeap(Store)
         size_t insert(ref Store store, in T entry)
         {
             store.insertBack(entry);
-            return store.siftUp(store.length - 1);
+            return siftUp(store, store.length - 1);
         }
 
         void remove(ref Store store, size_t idx)
@@ -153,7 +151,7 @@ public template BinaryHeap(Store)
 
             store.swapAt(idx, store.length - 1);
             store.removeBack();
-            store.siftUp(store.siftDown(idx));
+            siftUp(store, siftDown(store, idx));
         }
 }
 

@@ -202,3 +202,16 @@ public:
             this.token = token;
         }
     }
+
+    struct Timeout
+    {
+        import core.time : Duration;
+
+        mixin Operation!File;
+        Duration dur;
+
+        this(in Duration val)
+        {
+            dur = val;
+        }
+    }

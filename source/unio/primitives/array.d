@@ -14,7 +14,6 @@ TODO: Add support for auto-shrink after certain threshold (resizeArray)
 struct Array(T, Allocator)
 {
     import unio.primitives.allocator : makeArray, resizeArray, isStaticAllocator;
-    import std.container.array;
 
     enum defaultCapacity = 8;
 
@@ -47,7 +46,11 @@ struct Array(T, Allocator)
 
         ~this() @trusted
         {
-            alloc.deallocate(cast(void[]) data);
+            if (data !is null)
+            {
+                alloc.deallocate(cast(void[]) data);
+                data = null;
+            }
         }
 
         @property

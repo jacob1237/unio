@@ -18,6 +18,7 @@ Also, the values are nullable by default, so the end user doesn't have to care a
 
 TODO: Add support for auto-shrink after certain threshold
 TODO: Define invalid Key value for additional checks
+TODO: Think how to get rid of `realloc` (unrolled linked list with memory addresing?)
 */
 public struct ArrayPool(T, Allocator)
 {

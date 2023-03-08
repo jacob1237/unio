@@ -10,6 +10,7 @@ private:
     import core.sys.posix.unistd;
     import std.experimental.allocator.mallocator : Mallocator;
     import unio.primitives;
+    import unio.engine.modules.timers;
 
     enum SOCK_NONBLOCK = 0x800;
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
@@ -25,6 +26,7 @@ private:
         Receive = 0x01,
         Read = 0x02,
         Accept = 0x03,
+        Timeout = 0x04,
 
         // Write tasks
         Connect = 0x10,
@@ -70,23 +72,26 @@ private:
      */
     struct Task
     {
-        struct Data {
-            mixin Operation!int;
-        }
+        struct Data { mixin Operation!int; }
 
         OpType type;
         Status.Type status;
         Data data;
+
+        // FDInfo's pipeline pointers
+        Key prev;
         Key next;
-        long result;
 
         // Params
-        union {
+        union
+        {
             void[] buf;
             sockaddr addr;
             sockaddr* newAddr;
+            Timer timer;
         }
 
+        size_t result;
         int flags;
         @property bool isWrite() const { return cast(bool) (type & 0xF0); }
     }
@@ -140,6 +145,8 @@ public:
      * TODO: Handle setsockopt() `SO_RCVTIMEO` and `SO_SNDTIMEO` (check how do they react)
      * TODO: Call epoll_ctl(EPOLL_CTL_DEL) when there are no tasks for a file descriptor for a long time
      * TODO: Handle vectorized I/O (iovec)
+     * TODO: Handle EPOLLPRI to read the OOB data (support it in Recv/Send calls)
+     * TODO: Move epoll file handle to a separate Epoll struct to allow auto-destruction
      */
     class EpollEngine : IOEngine
     {
@@ -161,15 +168,35 @@ public:
         int epoll;
         int timeout;
 
+        /*
+        Timer related
+        */
+        Timers!(Key, Mallocator) timers;
+        TimerFd clock;
+
         /** 
          * Queue-related
          */
         Table!(FDInfo, initialCapacity, Mallocator) fds;
         ArrayPool!(Task, Mallocator) tasks;
 
-        // Run queue
+        /*
+        IDEA: Place runQueue on top of the task pool (doubly-linked list?) to achieve O(1) removal
+        */
         RingBuffer!(Key, queueSize) runQueue;
         RingBuffer!(Event, completionQueueSize) completionQueue;
+
+        /**
+        The function used by the `Timers` struct to resolve the Timer data from the given key.
+        This is required because we store the timers on top of the Task data.
+        */
+        auto resolveTimer(Key k) nothrow @nogc
+        {
+            import std.typecons : NullableRef;
+
+            auto timer = tasks.take(k, (scope ref Task t) => &t.timer, () => null);
+            return NullableRef!Timer(timer);
+        }
 
         /** 
          * Finish the task and set its result
@@ -273,6 +300,26 @@ public:
             }
         }
 
+        auto dispatchTimeout(scope ref FDInfo fdi, scope ref Task task)
+        {
+            timers.remove(task.timer);
+
+            const nextId = timers.front;
+
+            tasks.take(nextId, (scope ref Task next)
+            {
+                task.next = nextId;
+
+                if (!next.timer.expired)
+                {
+                    fdi.read.state = Pipeline.State.notReady;
+                    clock.arm(next.timer);
+                }
+            });
+
+            return 0;
+        }
+
         /**
          * Execute scheduled task
          *
@@ -299,6 +346,7 @@ public:
                     case OpType.Write: ret = dispatchWrite(fdi, task); break;
                     case OpType.Receive: ret = dispatchRecv(fdi, task); break;
                     case OpType.Send: ret = dispatchSend(fdi, task); break;
+                    case OpType.Timeout: ret = dispatchTimeout(fdi, task); break;
                 }
 
                 completeTask(pipeline, taskId, task, ret);
@@ -357,7 +405,7 @@ public:
             const fd = task.data.fd;
 
             // Create new FDInfo if doesn't exist and add it to epoll
-            with (fds.require(fd, register(fd)))
+            with (fds.require(fd, register(fd)).pipeline(task))
             {
                 /*
                 * When we already have the FDInfo in our list, we just need to update
@@ -366,26 +414,23 @@ public:
                 * 1. There are no associated tasks for this descriptor
                 * 2. There are already some scheduled tasks
                 */
-                with (pipeline(task))
+                if (!head)
                 {
-                    if (!head)
-                    {
-                        head = taskId;
-                        tail = taskId;
+                    head = taskId;
+                    tail = taskId;
 
-                        // Immediately put the task to the run queue because the file
-                        // descriptor is ready to perform reads or writes
-                        if (state == Pipeline.State.ready || task.isWrite) {
-                            runQueue.put(taskId);
-                        }
+                    // Immediately put the task to the run queue because the file
+                    // descriptor is ready to perform reads or writes
+                    if (state == Pipeline.State.ready || task.isWrite) {
+                        runQueue.put(taskId);
                     }
-                    else
-                    {
-                        tasks.take(tail, (ref Task lastTask) {
-                            lastTask.next = taskId;
-                            tail = taskId;
-                        });
-                    }
+                }
+                else
+                {
+                    tasks.take(tail, (ref Task lastTask) {
+                        lastTask.next = taskId;
+                        tail = taskId;
+                    });
                 }
             }
 
@@ -393,16 +438,15 @@ public:
         }
 
         /** 
-         * Process events coming from the epoll socket
-         */
+        Process events coming from the epoll socket
+        
+        TODO: Use epoll_pwait2() for a sub-millisecond Timeout implementation
+        */
         void processEvents(size_t minTasks = 0) @trusted
         {
-            auto ret = epoll_wait(epoll, events.ptr, cast(int) events.length, -1);
-
             // TODO: Gracefully handle epoll_wait errors 
-            if (ret <= 0) {
-                return;
-            }
+            auto ret = epoll_wait(epoll, events.ptr, cast(int) events.length, -1);
+            if (ret <= 0) return;
 
             foreach (ref ev; events[0 .. ret])
             {
@@ -438,18 +482,27 @@ public:
         }
 
     public:
-        this(size_t minCapacity = initialCapacity) @trusted
+        this()
         {
-            epoll = epoll_create1(0);
-            tasks = typeof(tasks)(minCapacity);
-            fds = typeof(fds)(initialCapacity);
+            this(initialCapacity);
         }
 
-        /** 
-         * TODO: Uninitialize containers and buffers
-         */
+        this(size_t minCapacity) @trusted
+        {
+            epoll = epoll_create1(0);
+
+            tasks = typeof(tasks)(minCapacity);
+            fds = typeof(fds)(initialCapacity);
+
+            // Initialize the timers subsystem
+            timers = typeof(timers)(tasks.capacity, &resolveTimer);
+            clock = typeof(clock).make();
+            fds[clock.fd] = register(clock.fd);
+        }
+
         ~this() @trusted
         {
+            unregister(clock.fd);
             .close(epoll);
         }
 
@@ -468,6 +521,29 @@ public:
                     () => IO(0)
                 );
             }
+        }
+
+        IO submit(Timeout op)
+        {
+            auto task = Task();
+            task.type = OpType.Timeout;
+            task.data.fd = clock.fd;
+            task.timer = Timer(op.dur);
+
+            const taskId = tasks.put(task);
+            timers.put(taskId);
+
+            // If after inserting a new timer, the front timer changes,
+            // we need to re-arm the clock
+            fds.take(clock.fd, (scope ref FDInfo fdi)
+            {
+                if (fdi.read.head == timers.front) return;
+
+                clock.arm(task.timer);
+                fdi.read.head = timers.front;
+            });
+
+            return IO(taskId);
         }
 
         /** 
@@ -494,6 +570,7 @@ public:
                 runTasks();
                 if (length) return tasks.length;
 
+                // TODO: Repeat processEvents() until there are some tasks to run or certain conditions met (timeout, minTasks)
                 processEvents(minTasks);
                 runTasks();
             }
@@ -607,7 +684,7 @@ unittest
 
     with (new EpollEngine())
     {
-        submit(Read(fd, buf));
+        () @trusted { submit(Read(fd, buf)); }();
         assert(wait() == 1, "Read operation must be blocking");
         assert(empty);
         assert(length == 0);
@@ -768,8 +845,8 @@ unittest
 
     with (io)
     {
-        const opRecv = submit(Receive(sockets[0], buf));
-        const opRead = submit(Read(sockets[0], buf));
+        const opRecv = (() @trusted => submit(Receive(sockets[0], buf)))();
+        const opRead = (() @trusted => submit(Read(sockets[0], buf)))();
         assert(wait() == 0);
 
         assertCompletion(io, [
@@ -779,25 +856,43 @@ unittest
     }
 }
 
-/+
-Test cases:
+@("epollSubmitTimeout")
+unittest
+{
+    import core.time;
+    import std.math;
 
-1. Connect
-    - Success
-    - Failure
-    - Connect after fail
-2. Accept
-    - Success
-    - Failure
-    - Accept after fail
-3. Read/Recv
-    - EOF/HUP handling: all subsequent scheduled reads must fail with EOF
-    - EINTR handling (retry read)
-    - Failure
-4. Write/Send
-    - Success
-    - Fail
-    - HUP handling: all subsequent scheduled writes (except Connect) must fail
-5. Chained operations
-    - Connect failed: finalize all Reads and Writes with faliure
-+/
+    static immutable dur1 = 1.msecs;
+    static immutable dur2 = 10.msecs;
+    static immutable drift = 200.usecs;
+
+    void assertDuration(Duration elapsed, Duration expected)
+    {
+        assert(abs(elapsed - expected) <= drift);
+    }
+
+    auto io = new EpollEngine();
+
+    with (io)
+    {
+        // Schedule timers in a reverse order to ensure the correct execution
+        const opTimeout2 = submit(Timeout(dur2));
+        const opTimeout1 = submit(Timeout(dur1));
+
+        const start1 = MonoTime.currTime;
+        const remaining1 = wait();
+        const elapsed1 = MonoTime.currTime - start1;
+
+        assert(remaining1 == 1);
+        assertDuration(elapsed1, dur1);
+        assertCompletion(io, [Event(opTimeout1, Token(), Result(Result.Type.Success, 0))]);
+
+        const start2 = MonoTime.currTime;
+        const remaining2 = wait();
+        const elapsed2 = MonoTime.currTime - start2;
+
+        assert(remaining2 == 0);
+        assertDuration(elapsed2, dur2 - dur1);
+        assertCompletion(io, [Event(opTimeout2, Token(), Result(Result.Type.Success, 0))]);
+    }
+}

@@ -105,6 +105,7 @@ public:
         IO submit(Send);
         IO submit(Read);
         IO submit(Write);
+        IO submit(Timeout);
 
         bool cancel(IO);
         size_t wait(size_t = 0);
