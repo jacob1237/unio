@@ -4,7 +4,7 @@ private import core.time;
 
 @safe:
 
-public struct Timer
+public struct MinHeapTimer
 {
     alias expiration this;
     private alias This = typeof(this);
@@ -49,8 +49,9 @@ public struct Timers(Key, Allocator)
     import unio.primitives.allocator : isStaticAllocator;
     import unio.primitives.queue : BinaryHeap;
 
-    private alias MinHeap = BinaryHeap!(Store);
+    public alias Timer = MinHeapTimer;
     public alias Resolver = NullableRef!Timer delegate (Key) nothrow @nogc;
+    private alias MinHeap = BinaryHeap!(Store);
 
     private struct Store
     {
@@ -150,6 +151,8 @@ unittest
     import std.typecons : NullableRef;
 
     alias Key = size_t;
+    alias TimersImpl = Timers!(Key, Mallocator);
+    alias Timer = TimersImpl.Timer;
 
     struct Entry
     {
@@ -164,7 +167,7 @@ unittest
     ];
 
     auto resolve = (Key k) => NullableRef!Timer(data.length > k - 1 ? &data[k - 1].timer : null);
-    auto t = Timers!(Key, Mallocator)(data.length, resolve);
+    auto t = TimersImpl(data.length, resolve);
 
     t.put(1);
     t.put(2);
@@ -205,10 +208,10 @@ public struct TimerFd
 
         static typeof(this) make() @trusted @nogc
         {
-            typeof(this) inst = void;
-            inst._fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+            typeof(this) instance = void;
+            instance._fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
 
-            return inst;
+            return instance;
         }
 
         @property int fd() const @nogc { return _fd; }

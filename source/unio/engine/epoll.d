@@ -16,6 +16,7 @@ private:
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
 
     alias Key = ArrayPool!(Task, Mallocator).Key;
+    alias Timer = Timers!(Key, Mallocator).Timer;
 
     /** 
      * Operation type enum.
