@@ -131,6 +131,58 @@ private:
         return err;
     }
 
+    struct Epoll(size_t MaxEvents)
+    {
+        import core.sys.linux.epoll;
+
+        enum
+        {
+            IN = EPOLLIN,
+            OUT = EPOLLOUT,
+            ERR = EPOLLERR,
+            HUP = EPOLLHUP,
+            RDHUP = EPOLLRDHUP,
+        }
+
+        private int epfd;
+
+        public:
+            epoll_event[MaxEvents] events;
+
+            @disable this();
+            @disable this(this);
+
+            this(int flags) @trusted
+            {
+                epfd = epoll_create1(flags);
+            }
+
+            ~this()
+            {
+                close(epfd);
+            }
+
+            int add(int fd) @trusted
+            {
+                epoll_event ev = {
+                    events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP,
+                    data: { fd: fd }
+                };
+
+                return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+            }
+
+            int remove(int fd) @trusted
+            {
+                return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, null);
+            }
+
+            int select(int timeout = 0) @trusted
+            {
+                return epoll_wait(epfd, events.ptr, MaxEvents, timeout);
+            }
+    }
+
 public:
     /** 
      * Epoll IO engine implementation
@@ -151,7 +203,6 @@ public:
      */
     class EpollEngine : IOEngine
     {
-        import core.sys.linux.epoll;
         import core.sys.posix.arpa.inet;
         import core.sys.posix.sys.socket;
         import core.time : Duration, msecs;
@@ -162,12 +213,7 @@ public:
         enum initialCapacity = 1024;
 
     protected:
-        /**
-         * Epoll-related
-         */
-        epoll_event[maxEvents] events;
-        int epoll;
-        int timeout;
+        Epoll!maxEvents selector;
 
         /*
         Timer related
@@ -189,7 +235,7 @@ public:
 
         /**
         The function used by the `Timers` struct to resolve the Timer data from the given key.
-        This is required because we store the timers on top of the Task data.
+        This is required because we store timers on top of the `Task` data.
         */
         auto resolveTimer(Key k) nothrow @nogc
         {
@@ -375,10 +421,9 @@ public:
         /** 
          * Register the file descriptor in Epoll and our internal data structures
          */
-        FDInfo register(int fd) @trusted
+        FDInfo register(int fd)
         {
-            epoll_event ev = { events: EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP, data: { fd: fd }};
-            epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
+            selector.add(fd);
             return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.notReady));
         }
 
@@ -387,14 +432,14 @@ public:
          */
         void unregister(int fd)
         {
-            fds.take(fd, (ref FDInfo fdi) @trusted
+            fds.take(fd, (ref FDInfo fdi)
             {
                 // TODO: Remove all tasks chain for the related FDInfo
                 if (fdi.read.head) tasks.remove(fdi.read.head);
                 if (fdi.write.head) tasks.remove(fdi.write.head);
 
                 fds.remove(fd);
-                epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null);
+                selector.remove(fd);
             });
         }
 
@@ -443,42 +488,45 @@ public:
         
         TODO: Use epoll_pwait2() for a sub-millisecond Timeout implementation
         */
-        void processEvents(size_t minTasks = 0) @trusted
+        void processEvents(size_t minTasks = 0)
         {
-            // TODO: Gracefully handle epoll_wait errors 
-            auto ret = epoll_wait(epoll, events.ptr, cast(int) events.length, -1);
-            if (ret <= 0) return;
-
-            foreach (ref ev; events[0 .. ret])
+            // TODO: Gracefully handle epoll_wait errors
+            with (selector)
             {
-                const fd = ev.data.fd;
+                auto ret = select(-1);
+                if (ret <= 0) return;
 
-                fds.take(
-                    fd,
-                    (ref FDInfo fdi)
-                    {
-                        // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
-                        if (ev.events & EPOLLIN)
+                foreach (ref ev; events[0 .. ret])
+                {
+                    const fd = ev.data.fd;
+
+                    fds.take(
+                        fd,
+                        (ref FDInfo fdi)
                         {
-                            fdi.read.state =
-                                ev.events & EPOLLERR ? Pipeline.State.error :
-                                ev.events & EPOLLRDHUP ? Pipeline.State.hup : Pipeline.State.ready;
+                            // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
+                            if (ev.events & IN)
+                            {
+                                fdi.read.state =
+                                    ev.events & ERR ? Pipeline.State.error :
+                                    ev.events & RDHUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                            if (fdi.read.head in tasks) runQueue.put(fdi.read.head);
-                        }
+                                if (fdi.read.head in tasks) runQueue.put(fdi.read.head);
+                            }
 
-                        // TODO: Handle partially-completed write operations (and retries in case of EINTR)
-                        if (ev.events & EPOLLOUT)
-                        {
-                            fdi.write.state =
-                                ev.events & EPOLLERR ? Pipeline.State.error :
-                                ev.events & EPOLLHUP ? Pipeline.State.hup : Pipeline.State.ready;
+                            // TODO: Handle partially-completed write operations (and retries in case of EINTR)
+                            if (ev.events & OUT)
+                            {
+                                fdi.write.state =
+                                    ev.events & ERR ? Pipeline.State.error :
+                                    ev.events & HUP ? Pipeline.State.hup : Pipeline.State.ready;
 
-                            if (fdi.write.head in tasks) runQueue.put(fdi.write.head);
-                        }
-                    },
-                    () @trusted { epoll_ctl(epoll, EPOLL_CTL_DEL, fd, null); }
-                );
+                                if (fdi.write.head in tasks) runQueue.put(fdi.write.head);
+                            }
+                        },
+                        () => remove(fd)
+                    );
+                }
             }
         }
 
@@ -488,10 +536,9 @@ public:
             this(initialCapacity);
         }
 
-        this(size_t minCapacity) @trusted
+        this(size_t minCapacity)
         {
-            epoll = epoll_create1(0);
-
+            selector = typeof(selector)(0);
             tasks = typeof(tasks)(minCapacity);
             fds = typeof(fds)(initialCapacity);
 
@@ -501,10 +548,9 @@ public:
             fds[clock.fd] = register(clock.fd);
         }
 
-        ~this() @trusted
+        ~this()
         {
             unregister(clock.fd);
-            .close(epoll);
         }
 
         alias List(Elem...) = Elem;
