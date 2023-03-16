@@ -1,10 +1,11 @@
 module unio.primitives.queue;
 
-@safe @nogc:
-
 import core.lifetime : copyEmplace;
 import std.range.primitives : isInputRange, isOutputRange, hasLength;
 import std.range.interfaces : InputRange, OutputRange;
+import std.typecons : NullableRef;
+
+@safe @nogc:
 
 public enum isQueue(R) =
     isInputRange!R &&
@@ -209,4 +210,139 @@ unittest
         popFront();
         assert(empty);
     }
+}
+
+/** 
+The Queue implements a FIFO queue on top of an external storage. It doesn't retain any data
+itself, except the `tail` and `head` pointers, but from the interface viewpoint,
+it stores node IDs/keys in a specific order, being compatible with the built-in Range interface.
+
+The `Resolver` delegate is required for obtaining data from the storage.
+
+To be compatible with the queue interface, the storage entry must have the `prev` and `next` fields
+in its body.
+
+Time complexity:
+    - Insert: O(1)
+    - Remove: O(1)
+*/
+public struct Queue(K)
+{
+    alias Resolver = NullableRef!Node delegate (K) @nogc;
+
+    struct Node
+    {
+        K prev;
+        K next;
+    }
+
+    private:
+        Resolver resolve;
+        K head;
+        K tail;
+
+    public:
+        @disable this();
+        @disable this(this);
+
+        this(Resolver r)
+        {
+            resolve = r;
+        }
+
+        @property
+        {
+            bool empty() const { return !head; }
+            K front() { return head; }
+        }
+
+        void put(K entry)
+        {
+            with (resolve(entry))
+            {
+                if (isNull) return;
+
+                if (tail) { with (resolve(tail)) if (!isNull) next = entry; }
+                else { head = entry; }
+
+                prev = tail;
+                tail = entry;
+            }
+        }
+
+        void remove(in Node node)
+        {
+            with (node)
+            {
+                auto prevNode = resolve(prev);
+                if (prevNode.isNull) { head = next; }
+                else { prevNode.next = next; }
+
+                auto nextNode = resolve(next);
+                if (nextNode.isNull) { tail = prev; }
+                else { nextNode.prev = prev; }
+            }
+        }
+
+        void popFront()
+        {
+            auto node = resolve(head);
+            if (!node.isNull) remove(node);
+        }
+}
+
+@("queuePutRemove")
+unittest
+{
+    alias Key = size_t;
+    alias Node = Queue!(Key).Node;
+
+    struct Entry
+    {
+        size_t id;
+        Node node;
+    }
+
+    Entry[3] data = [Entry(1), Entry(2), Entry(3)];
+
+    auto resolve(Key k)
+    {
+        const idx = k - 1;
+        return NullableRef!Node(idx <= data.length ? &data[idx].node : null);
+    }
+
+    import std.functional : toDelegate;
+    auto q = Queue!(Key)(toDelegate(&resolve));
+
+    assert(q.empty);
+
+    q.put(1);
+    q.put(2);
+    q.put(3);
+    with (resolve(1)) assert(prev == 0 && next == 2);
+    with (resolve(2)) assert(prev == 1 && next == 3);
+    with (resolve(3)) assert(prev == 2 && next == 0);
+    assert(!q.empty);
+    assert(q.front == 1);
+    assert(q.head == 1);
+    assert(q.tail == 3);
+
+    q.remove(resolve(2));
+    with (resolve(1)) assert(prev == 0 && next == 3);
+    with (resolve(3)) assert(prev == 1 && next == 0);
+    assert(!q.empty);
+    assert(q.front == 1);
+    assert(q.head == 1);
+    assert(q.tail == 3);
+
+    q.remove(resolve(1));
+    with (resolve(3)) assert(prev == 0 && next == 0);
+    assert(!q.empty);
+    assert(q.head == 3);
+    assert(q.tail == 3);
+
+    q.popFront();
+    assert(q.empty);
+    assert(q.head == 0);
+    assert(q.tail == 0);
 }

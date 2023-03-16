@@ -16,6 +16,7 @@ private:
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
 
     alias Key = ArrayPool!(Task, Mallocator).Key;
+    alias Node = Queue!(Key).Node;
     alias Timer = Timers!(Key, Mallocator).Timer;
 
     /** 
@@ -83,6 +84,8 @@ private:
         Key prev;
         Key next;
 
+        Node node;
+
         // Params
         union
         {
@@ -94,7 +97,9 @@ private:
 
         size_t result;
         int flags;
+
         @property bool isWrite() const { return cast(bool) (type & 0xF0); }
+        Result toResult() { return Result(toResultType(status), result); }
     }
 
     /** 
@@ -131,6 +136,9 @@ private:
         return err;
     }
 
+    /** 
+    TODO: Make the `events` range unified across all selectors
+    */
     struct Epoll(size_t MaxEvents)
     {
         import core.sys.linux.epoll;
@@ -183,6 +191,11 @@ private:
             }
     }
 
+    struct Stats
+    {
+        size_t pending;
+    }
+
 public:
     /** 
      * Epoll IO engine implementation
@@ -206,6 +219,7 @@ public:
         import core.sys.posix.arpa.inet;
         import core.sys.posix.sys.socket;
         import core.time : Duration, msecs;
+        import std.typecons : NullableRef;
 
         enum maxEvents = 256;
         enum queueSize = 1024;
@@ -227,11 +241,18 @@ public:
         Table!(FDInfo, initialCapacity, Mallocator) fds;
         ArrayPool!(Task, Mallocator) tasks;
 
-        /*
-        IDEA: Place runQueue on top of the task pool (doubly-linked list?) to achieve O(1) removal
-        */
-        RingBuffer!(Key, queueSize) runQueue;
+        Queue!(Key) runQueue;
         RingBuffer!(Event, completionQueueSize) completionQueue;
+
+        Stats stats;
+
+        /**
+        Linked list node resolver for the run queue
+        */
+        auto resolveNode(Key k) nothrow @nogc
+        {
+            return NullableRef!Node(tasks.take(k, (ref Task t) => &t.node, () => null));
+        }
 
         /**
         The function used by the `Timers` struct to resolve the Timer data from the given key.
@@ -239,10 +260,7 @@ public:
         */
         auto resolveTimer(Key k) nothrow @nogc
         {
-            import std.typecons : NullableRef;
-
-            auto timer = tasks.take(k, (scope ref Task t) => &t.timer, () => null);
-            return NullableRef!Timer(timer);
+            return NullableRef!Timer(tasks.take(k, (ref Task t) => &t.timer, () => null));
         }
 
         /** 
@@ -279,10 +297,10 @@ public:
                 }
             }
 
+            stats.pending--;
+
             const event = Event(IO(taskId), task.data.token, Result(status.toResultType, task.result));
             completionQueue.put(event);
-
-            tasks.remove(taskId);
         }
 
         auto dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
@@ -480,6 +498,8 @@ public:
                 }
             }
 
+            stats.pending++;
+
             return IO(taskId);
         }
 
@@ -542,6 +562,9 @@ public:
             tasks = typeof(tasks)(minCapacity);
             fds = typeof(fds)(initialCapacity);
 
+            // Initialize work queues
+            runQueue = typeof(runQueue)(&resolveNode);
+
             // Initialize the timers subsystem
             timers = typeof(timers)(tasks.capacity, &resolveTimer);
             clock = typeof(clock).make();
@@ -578,6 +601,8 @@ public:
             task.timer = Timer(op.dur);
 
             const taskId = tasks.put(task);
+            stats.pending++;
+
             timers.put(taskId);
 
             // If after inserting a new timer, the front timer changes,
@@ -612,20 +637,24 @@ public:
          */
         size_t wait(size_t minTasks = 1)
         {
-            if (!tasks.empty)
+            if (stats.pending)
             {
                 runTasks();
-                if (length) return tasks.length;
+                if (length) return stats.pending;
 
                 // TODO: Repeat processEvents() until there are some tasks to run or certain conditions met (timeout, minTasks)
                 processEvents(minTasks);
                 runTasks();
             }
 
-            return tasks.length;
+            return stats.pending;
         }
 
-        void popFront() { completionQueue.popFront(); }
+        void popFront()
+        {
+            completionQueue.popFront();
+            tasks.remove(cast(Key) completionQueue.front.op);
+        }
 
         @property
         {
