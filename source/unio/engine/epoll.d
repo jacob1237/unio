@@ -242,7 +242,7 @@ public:
         ArrayPool!(Task, Mallocator) tasks;
 
         Queue!(Key) runQueue;
-        RingBuffer!(Event, completionQueueSize) completionQueue;
+        Queue!(Key) completionQueue;
 
         Stats stats;
 
@@ -297,10 +297,7 @@ public:
                 }
             }
 
-            stats.pending--;
-
-            const event = Event(IO(taskId), task.data.token, Result(status.toResultType, task.result));
-            completionQueue.put(event);
+            completionQueue.put(taskId);
         }
 
         auto dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
@@ -426,9 +423,10 @@ public:
          */
         void runTasks()
         {
-            for (; !runQueue.empty; runQueue.popFront())
+            while (!runQueue.empty)
             {
                 auto taskId = runQueue.front;
+                runQueue.popFront();
 
                 tasks.take(taskId, (ref Task task) =>
                     fds.take(task.data.fd, (ref FDInfo fdi) =>
@@ -498,8 +496,6 @@ public:
                 }
             }
 
-            stats.pending++;
-
             return IO(taskId);
         }
 
@@ -564,6 +560,7 @@ public:
 
             // Initialize work queues
             runQueue = typeof(runQueue)(&resolveNode);
+            completionQueue = typeof(completionQueue)(&resolveNode);
 
             // Initialize the timers subsystem
             timers = typeof(timers)(tasks.capacity, &resolveTimer);
@@ -601,7 +598,6 @@ public:
             task.timer = Timer(op.dur);
 
             const taskId = tasks.put(task);
-            stats.pending++;
 
             timers.put(taskId);
 
@@ -637,30 +633,43 @@ public:
          */
         size_t wait(size_t minTasks = 1)
         {
-            if (stats.pending)
+            if (pending)
             {
                 runTasks();
-                if (length) return stats.pending;
+                if (length) return pending;
 
                 // TODO: Repeat processEvents() until there are some tasks to run or certain conditions met (timeout, minTasks)
                 processEvents(minTasks);
                 runTasks();
             }
 
-            return stats.pending;
+            return pending;
         }
 
         void popFront()
         {
+            const taskId = completionQueue.front;
+
             completionQueue.popFront();
-            tasks.remove(cast(Key) completionQueue.front.op);
+            tasks.remove(taskId);
         }
 
         @property
         {
+            size_t pending() const { return tasks.length - completionQueue.length; }
             size_t length() const { return completionQueue.length; }
             bool empty() const { return completionQueue.empty; }
-            Event front() const { return completionQueue.front; }
+
+            Event front()
+            {
+                const taskId = completionQueue.front;
+
+                return tasks.take(
+                    taskId,
+                    (ref Task t) const => Event(IO(taskId), t.data.token, Result(t.status.toResultType, t.result)),
+                    () const => Event()
+                );
+            }
         }
 
         /** 

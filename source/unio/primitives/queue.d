@@ -237,9 +237,10 @@ public struct Queue(K)
     }
 
     private:
-        Resolver resolve;
         K head;
         K tail;
+        size_t _length;
+        Resolver resolve;
 
     public:
         @disable this();
@@ -252,8 +253,9 @@ public struct Queue(K)
 
         @property
         {
-            bool empty() const { return !head; }
-            K front() { return head; }
+            size_t length() const { return _length; }
+            bool empty() const { return !length; }
+            inout(K) front() inout { return head; }
         }
 
         void put(K entry)
@@ -267,6 +269,8 @@ public struct Queue(K)
 
                 prev = tail;
                 tail = entry;
+
+                _length++;
             }
         }
 
@@ -281,6 +285,8 @@ public struct Queue(K)
                 auto nextNode = resolve(next);
                 if (nextNode.isNull) { tail = prev; }
                 else { nextNode.prev = prev; }
+
+                _length--;
             }
         }
 
@@ -315,6 +321,7 @@ unittest
     auto q = Queue!(Key)(toDelegate(&resolve));
 
     assert(q.empty);
+    assert(q.length == 0);
 
     q.put(1);
     q.put(2);
@@ -323,6 +330,7 @@ unittest
     with (resolve(2)) assert(prev == 1 && next == 3);
     with (resolve(3)) assert(prev == 2 && next == 0);
     assert(!q.empty);
+    assert(q.length == 3);
     assert(q.front == 1);
     assert(q.head == 1);
     assert(q.tail == 3);
@@ -331,6 +339,7 @@ unittest
     with (resolve(1)) assert(prev == 0 && next == 3);
     with (resolve(3)) assert(prev == 1 && next == 0);
     assert(!q.empty);
+    assert(q.length == 2);
     assert(q.front == 1);
     assert(q.head == 1);
     assert(q.tail == 3);
@@ -338,11 +347,13 @@ unittest
     q.remove(resolve(1));
     with (resolve(3)) assert(prev == 0 && next == 0);
     assert(!q.empty);
+    assert(q.length == 1);
     assert(q.head == 3);
     assert(q.tail == 3);
 
     q.popFront();
     assert(q.empty);
+    assert(q.length == 0);
     assert(q.head == 0);
     assert(q.tail == 0);
 }

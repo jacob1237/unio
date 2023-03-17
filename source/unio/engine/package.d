@@ -116,6 +116,6 @@ public:
         {
             size_t length() const;
             bool empty() const;
-            Event front() const;
+            Event front();
         }
     }
