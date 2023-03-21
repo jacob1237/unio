@@ -136,7 +136,7 @@ public struct ArrayPool(T, Allocator)
             if (key == 0) return false;
 
             const idx = key - 1;
-            return capacity > idx && !data[idx].entry.isNull;
+            return idx < capacity && !data[idx].entry.isNull;
         }
 
         Key put(T val)
@@ -171,7 +171,12 @@ public struct ArrayPool(T, Allocator)
 
             const idx = key - 1;
 
-            data[idx].entry.nullify();
+            with (data[idx])
+            {
+                entry.nullify();
+                next = this.next;
+            }
+
             next = idx;
             _length--;
         }
@@ -290,4 +295,23 @@ unittest
     assert(p.capacity == capacity);
     assert(1 !in p);
     assert(2 !in p);
+}
+
+@("poolPutRemove")
+unittest
+{
+    auto p = ArrayPool!(uint, TestAlloc)(5);
+
+    assert(p.put(1) == 1);
+    assert(p.put(2) == 2);
+    assert(p.put(3) == 3);
+
+    p.remove(2);
+    p.remove(1);
+
+    assert(p.put(4) == 1);
+    assert(p.put(5) == 2);
+    assert(p.put(6) == 4);
+
+    assert(p.length == 4);
 }
