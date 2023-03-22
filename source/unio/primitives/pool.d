@@ -212,24 +212,24 @@ unittest
     assert(p.length == 0);
 }
 
-// @("poolReset")
-// unittest
-// {
-//     static immutable capacity = 2;
+@("poolReset")
+unittest
+{
+    static immutable capacity = 2;
 
-//     auto p = ArrayPool!(User, TestAlloc)(capacity);
-//     auto usr = User(10, "Test Reset");
+    auto p = ArrayPool!(User, TestAlloc)(capacity);
+    auto usr = User(10, "Test Reset");
 
-//     foreach (i; 0 .. capacity * 4) p.put(usr);
-//     assert(p.length == capacity * 4);
-//     assert(p.capacity == capacity * 4);
+    foreach (i; 0 .. capacity * 4) p.put(usr);
+    assert(p.length == capacity * 4);
+    assert(p.capacity == capacity * 4);
 
-//     p.reset();
-//     assert(p.length == 0);
-//     assert(p.capacity == capacity);
-//     assert(1 !in p);
-//     assert(2 !in p);
-// }
+    p.reset();
+    assert(p.length == 0);
+    assert(p.capacity == capacity);
+    assert(1 !in p);
+    assert(2 !in p);
+}
 
 @("poolPutRemove")
 unittest
