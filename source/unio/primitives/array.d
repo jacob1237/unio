@@ -20,28 +20,30 @@ struct Array(T, Allocator)
     private:
         size_t head;
         T[] data;
+        size_t initialCapacity;
 
         static if (isStaticAllocator!Allocator) alias alloc = Allocator.instance;
         else Allocator alloc;
 
-        void initialize(size_t capacity) @trusted
+        void initialize(size_t capacity, bool init = true) @trusted
         {
-            data = alloc.makeArray!(T)(capacity ? capacity : defaultCapacity);
+            initialCapacity = capacity ? capacity : defaultCapacity;
+            data = alloc.makeArray!(T)(initialCapacity, init);
         }
 
     public:
         @disable this(this);
 
-        this(size_t capacity)
+        this(size_t capacity, bool init = true)
         {
-            initialize(capacity);
+            initialize(capacity, init);
         }
 
         static if (!isStaticAllocator!Allocator)
-        this(Allocator allocator, size_t capacity)
+        this(Allocator allocator, size_t capacity, bool init = true)
         {
             alloc = allocator;
-            initialize(capacity);
+            initialize(capacity, init);
         }
 
         ~this() @trusted
@@ -63,7 +65,6 @@ struct Array(T, Allocator)
 
         ref inout(T) opIndex(size_t idx) inout
         {
-            if (idx >= head) assert(false, "Array index is out of bounds");
             return data[idx];
         }
 
@@ -71,11 +72,10 @@ struct Array(T, Allocator)
 
         auto opSlice(size_t start, size_t end)
         {
-            if (start >= head || end > head) assert(false, "Array index is out of bounds");
             return data[start .. end];
         }
 
-        void insertBack(in T val)
+        void insertBack(T val)
         {
             if (head >= capacity) alloc.resizeArray(data, capacity << 1);
             data[head++] = val;
@@ -84,6 +84,12 @@ struct Array(T, Allocator)
         void removeBack()
         {
             if (head) head--;
+        }
+
+        void reset()
+        {
+            head = 0;
+            alloc.resizeArray(data, initialCapacity);
         }
 }
 
