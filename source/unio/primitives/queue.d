@@ -262,14 +262,16 @@ public struct Queue(K)
         {
             with (resolve(entry))
             {
-                if (isNull) return;
+                if (isNull) assert(false, "Can't insert a non-existing entry into the Queue");
 
-                if (tail) { with (resolve(tail)) if (!isNull) next = entry; }
+                auto tailNode = resolve(tail);
+                if (!tailNode.isNull) { tailNode.next = entry; }
                 else { head = entry; }
 
                 prev = tail;
-                tail = entry;
+                next = K.init;
 
+                tail = entry;
                 _length++;
             }
         }
@@ -293,7 +295,9 @@ public struct Queue(K)
         void popFront()
         {
             auto node = resolve(head);
-            if (!node.isNull) remove(node);
+            if (node.isNull) assert(false, "Can't pop a non-existing entry from the Queue");
+
+            remove(node);
         }
 }
 
