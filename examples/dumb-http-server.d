@@ -3,6 +3,7 @@
 /+ dub.sdl:
     name "dumb_http_server"
     dependency "unio" path=".."
+    compiler "ldc2"
 +/
 module examples.dumb_http_server;
 
@@ -124,11 +125,11 @@ private:
             return;
         }
 
-        const fd = Socket(cast(int) result.value);
-        conns[fd].connect(fd);
-
         // Continue accepting connections
         accept();
+
+        const fd = Socket(cast(int) result.value);
+        conns[fd].connect(fd);
     }
 
 public:
