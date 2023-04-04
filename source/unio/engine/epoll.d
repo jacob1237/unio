@@ -192,9 +192,9 @@ public:
      *
      * TODO: Add `Cancel` support for all operations on a specific file descriptor
      * TODO: Add support for the `Wait` operation
-     * TODO: Add suport for the `Timeout` operation
      * TODO: Distinguish different types of file descriptors
      * TODO: Add support for async file operations (via AIO/io_submit or a dedicated thread pool)
+     * TODO: Parallelize IO operations (thread pool?)
      * TODO: Handle connection errors both for read/write operations
      * TODO: Rename read/write task types to input/output
      * TODO: Edge case: epoll may notify readiness for send(), but EAGAIN will be returned: https://habr.com/ru/post/416669/#comment_18865881
@@ -202,7 +202,6 @@ public:
      * TODO: Call epoll_ctl(EPOLL_CTL_DEL) when there are no tasks for a file descriptor for a long time
      * TODO: Handle vectorized I/O (iovec)
      * TODO: Handle EPOLLPRI to read the OOB data (support it in Recv/Send calls)
-     * TODO: Move epoll file handle to a separate Epoll struct to allow auto-destruction
      */
     class EpollEngine : IOEngine
     {
