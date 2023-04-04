@@ -16,7 +16,6 @@ private:
     extern (C) int accept4(int, sockaddr*, socklen_t*, int);
 
     alias Key = ArrayPool!(Task, Mallocator).Key;
-    alias Node = Queue!(Key).Node;
     alias Timer = Timers!(Key, Mallocator).Timer;
 
     /** 
@@ -41,16 +40,15 @@ private:
      */
     struct Pipeline
     {
-        enum State : ubyte { ready, notReady, error, hup }
+        enum Status : ubyte { ready, notReady, error, hup }
 
-        State state;
-        Key head; // First task in the queue
-        Key tail; // Last task in the queue
+        Status status;
+        Queue!(Key).State state;
 
         @property
         {
-            bool ready() { return state != State.notReady; }
-            bool error() { return state == State.error; }
+            bool ready() { return status != Status.notReady; }
+            bool error() { return status == Status.error; }
         }
     }
 
@@ -63,7 +61,7 @@ private:
         Pipeline read;
         Pipeline write;
 
-        ref Pipeline pipeline(ref Task t) return { return t.isWrite ? write : read; }
+        ref Pipeline pipeline(const scope ref Task t) return { return t.isWrite ? write : read; }
     }
 
     /** 
@@ -80,11 +78,8 @@ private:
         Status.Type status;
         Data data;
 
-        // FDInfo's pipeline pointers
-        Key prev;
-        Key next;
-
-        Node node;
+        Queue!(Key).Entry pipelineEntry;
+        Queue!(Key).Entry queueEntry;
 
         // Params
         union
@@ -98,8 +93,8 @@ private:
         size_t result;
         int flags;
 
-        @property bool isWrite() const { return cast(bool) (type & 0xF0); }
-        Result toResult() { return Result(toResultType(status), result); }
+        @property bool isWrite() scope const { return cast(bool) (type & 0xF0); }
+        Result toResult() scope { return Result(toResultType(status), result); }
     }
 
     /** 
@@ -191,11 +186,6 @@ private:
             }
     }
 
-    struct Stats
-    {
-        size_t pending;
-    }
-
 public:
     /** 
      * Epoll IO engine implementation
@@ -222,11 +212,37 @@ public:
         import std.typecons : NullableRef;
 
         enum maxEvents = 256;
-        enum queueSize = 1024;
-        enum completionQueueSize = queueSize * 2;
         enum initialCapacity = 1024;
 
     protected:
+        struct IOResult
+        {
+            private alias This = typeof(this);
+
+            Status.Type type;
+            size_t value;
+            alias value this;
+
+            static
+            {
+                auto error(size_t code) { return This(Status.Type.Error, code); }
+                auto success(size_t code) { return This(Status.Type.Success, code); }
+                auto from(long ret)
+                {
+                    return ret < 0 ? This(Status.Type.Error, errno) : This(Status.Type.Success, ret);
+                }
+            }
+
+            @property
+            {
+                bool failed() const { return type == Status.Type.Error; }
+                bool inProgress() const
+                {
+                    return failed && (value == EINPROGRESS || value == EWOULDBLOCK || value == EAGAIN);
+                }
+            }
+        }
+
         Epoll!maxEvents selector;
 
         /*
@@ -241,17 +257,25 @@ public:
         Table!(FDInfo, initialCapacity, Mallocator) fds;
         ArrayPool!(Task, Mallocator) tasks;
 
-        Queue!(Key) runQueue;
-        Queue!(Key) completionQueue;
-
-        Stats stats;
+        Queue!(Key).Range runQueue;
+        Queue!(Key).Range completionQueue;
+        Queue!(Key) pipelines;
 
         /**
         Linked list node resolver for the run queue
         */
-        auto resolveNode(Key k) nothrow @nogc
+        auto resolveQueueEntry(Key k) nothrow @nogc
         {
-            return NullableRef!Node(tasks.take(k, (ref Task t) => &t.node, () => null));
+            return NullableRef!(Queue!(Key).Entry)(
+                tasks.take(k, (ref Task t) => &t.queueEntry, () => null)
+            );
+        }
+
+        auto resolvePipelineEntry(Key k) nothrow @nogc
+        {
+            return NullableRef!(Queue!(Key).Entry)(
+                tasks.take(k, (ref Task t) => &t.pipelineEntry, () => null)
+            );
         }
 
         /**
@@ -263,47 +287,113 @@ public:
             return NullableRef!Timer(tasks.take(k, (ref Task t) => &t.timer, () => null));
         }
 
+        /**
+        The rules of cancelling a timeout are a bit different than for a regular task:
+
+        because timers are not using the pipeline in the same way, we need to manually re-arm
+        the timer clock if after removing the current timer, the pipeline head changes
+        */
+        void cancelTimeout(scope ref FDInfo fdi, scope ref Task task)
+        {
+            timers.remove(task.timer);
+
+            with (pipelines.make(fdi.read.state))
+            {
+                if (timers.empty || timers.front == front) return;
+
+                const nextId = timers.front;
+
+                reset();
+                put(nextId);
+
+                tasks.take(nextId, (scope ref Task next) => clock.arm(next.timer));
+            }
+        }
+
+        /** 
+        Submit the specified task to the run queue
+        */
+        void enqueueTask(Key taskId)
+        {
+            tasks.take(taskId, (scope ref Task t)
+            {
+                if (t.status == Status.Type.Pending)
+                {
+                    t.status = Status.Type.Running;
+                    runQueue.put(taskId);
+                }
+            });
+        }
+
+        /**
+        Cancel the task by its ID.
+        If the cancellation was successful, the task will be moved to the completion queue
+        and a user may expect to get an error result with ECANCELED
+
+        TODO: Ensure that completed tasks do not exist in this state inside the pipeline to prevent infinite cancellation loop in `unregister()``
+        */
+        bool cancelTask(Key taskId)
+        {
+            return tasks.take(
+                taskId,
+                (scope ref Task task)
+                {
+                    switch (task.status)
+                    {
+                        case Status.Type.Running:
+                            runQueue.remove(task.queueEntry);
+                            goto case;
+
+                        case Status.Type.Pending:
+                            fds.take(task.data.fd, (scope ref FDInfo fdi) @safe
+                            {
+                                if (task.type == OpType.Timeout) cancelTimeout(fdi, task);
+                                else pipelines
+                                    .make(fdi.pipeline(task).state)
+                                    .remove(task.pipelineEntry);
+                            });
+
+                            task.status = Status.Type.Error;
+                            task.result = ECANCELED;
+
+                            completionQueue.put(taskId);
+                            return true;
+
+                        default:
+                            return false;
+                    }
+                },
+                () => false
+            );
+        }
+
         /** 
          * Finish the task and set its result
          * Updates pipeline state for the next task
          */
-        void completeTask(ref Pipeline pipeline, const Key taskId, ref Task task, long ret)
+        void completeTask(ref Pipeline pipeline, in Key taskId, ref Task task, in IOResult res)
         {
-            const status = ret < 0 ? Status.Type.Error : Status.Type.Success;
-            const result = ret < 0 ? errno() : ret;
+            task.status = res.type;
+            task.result = res.value;
 
-            // Postpone the blocking task completion until new fd event arrives
-            if (result == EINPROGRESS || result == EAGAIN || result == EWOULDBLOCK) {
-                pipeline.state = Pipeline.State.notReady;
-                return;
-            }
-
-            task.status = status;
-            task.result = result;
-
-            if (!task.next)
+            with (pipelines.make(pipeline.state))
             {
-                pipeline.head = 0;
-                pipeline.tail = 0;
-            }
-            else
-            {
-                pipeline.head = task.next;
+                popFront();
 
                 // If the pipeline readiness didn't change, we add the next task
                 // to the running queue immediately
-                if (pipeline.ready || task.isWrite) {
-                    runQueue.put(pipeline.head);
+                if (!empty && (pipeline.ready || task.isWrite)) {
+                    enqueueTask(front);
                 }
             }
 
             completionQueue.put(taskId);
         }
 
-        auto dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchAccept(ref FDInfo fdi, ref Task task) @trusted
         {
             socklen_t addrLen;
-            return accept4(fdi.fd, task.newAddr, &addrLen, SOCK_NONBLOCK);
+            return IOResult.from(accept4(fdi.fd, task.newAddr, &addrLen, SOCK_NONBLOCK));
         }
 
         /** 
@@ -312,74 +402,75 @@ public:
          * Because connect() may return `EINPROGRESS` on the first run, the funcion will
          * postpone task completion until the next run (or EPOLLERR)
          */
-        auto dispatchConnect(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchConnect(ref FDInfo fdi, ref Task task) @trusted
         {
-            switch (fdi.write.state)
+            switch (fdi.write.status)
             {
-                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
-                case Pipeline.State.ready: return 0;
-                default: return connect(fdi.fd, &task.addr, task.addr.sizeof);
+                case Pipeline.Status.error: return IOResult.error(fdi.fd.lastSocketError);
+                case Pipeline.Status.ready: return IOResult.success(0);
+                default: return IOResult.from(connect(fdi.fd, &task.addr, task.addr.sizeof));
             }
         }
 
         /** 
          * TODO: Handle EOF (or peer shutdown)
          */
-        auto dispatchRead(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchRead(ref FDInfo fdi, ref Task task) @trusted
         {
-            if (fdi.read.state == Pipeline.State.hup) return 0;
+            if (fdi.read.status == Pipeline.Status.hup) return IOResult.success(0);
 
             const ret = read(fdi.fd, task.buf.ptr, task.buf.length);
-            if (ret == 0) fdi.read.state = Pipeline.State.hup;
+            if (ret == 0) fdi.read.status = Pipeline.Status.hup;
 
-            return ret;
+            return IOResult.from(ret);
         }
 
-        auto dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchRecv(ref FDInfo fdi, ref Task task) @trusted
         {
-            switch (fdi.read.state)
+            switch (fdi.read.status)
             {
-                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
-                case Pipeline.State.hup: return 0;
+                case Pipeline.Status.error: return IOResult.error(fdi.fd.lastSocketError);
+                case Pipeline.Status.hup: return IOResult.success(0);
                 default:
                     const ret = recv(fdi.fd, task.buf.ptr, task.buf.length, task.flags);
-                    if (ret == 0) fdi.read.state = Pipeline.State.hup;
-                    return ret;
+                    if (ret == 0) fdi.read.status = Pipeline.Status.hup;
+                    return IOResult.from(ret);
             }
         }
 
-        auto dispatchWrite(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchWrite(ref FDInfo fdi, ref Task task) @trusted
         {
-            return write(fdi.fd, task.buf.ptr, task.buf.length);
+            return IOResult.from(write(fdi.fd, task.buf.ptr, task.buf.length));
         }
 
-        auto dispatchSend(ref FDInfo fdi, ref Task task) @trusted
+        IOResult dispatchSend(ref FDInfo fdi, ref Task task) @trusted
         {
-            switch (fdi.write.state)
+            switch (fdi.write.status)
             {
-                case Pipeline.State.error: errno = lastSocketError(fdi.fd); return -1;
-                default: return send(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags | MSG_NOSIGNAL);
+                case Pipeline.Status.error: return IOResult.error(fdi.fd.lastSocketError);
+                default: return IOResult.from(
+                    send(fdi.fd, task.buf.ptr, cast(int) task.buf.length, task.flags | MSG_NOSIGNAL)
+                );
             }
         }
 
-        auto dispatchTimeout(scope ref FDInfo fdi, scope ref Task task)
+        IOResult dispatchTimeout(scope ref FDInfo fdi, scope ref Task task)
         {
             timers.remove(task.timer);
-
             const nextId = timers.front;
 
             tasks.take(nextId, (scope ref Task next)
             {
-                task.next = nextId;
+                pipelines.make(fdi.read.state).put(nextId);
 
                 if (!next.timer.expired)
                 {
-                    fdi.read.state = Pipeline.State.notReady;
+                    fdi.read.status = Pipeline.Status.notReady;
                     clock.arm(next.timer);
                 }
             });
 
-            return 0;
+            return IOResult.success(0);
         }
 
         /**
@@ -393,25 +484,28 @@ public:
             {
                 // Just a hack for now
                 // TODO: Handle EPOLLRDHUP correctly
-                if (pipeline.state == Pipeline.State.hup && task.isWrite) {
-                    completeTask(pipeline, taskId, task, EPIPE);
-                    return;
+                if (pipeline.status == Pipeline.Status.hup && task.isWrite) {
+                    return completeTask(pipeline, taskId, task, IOResult.error(EPIPE));
                 }
 
-                long ret;
+                IOResult res;
 
                 final switch (task.type)
                 {
-                    case OpType.Accept: ret = dispatchAccept(fdi, task); break;
-                    case OpType.Connect: ret = dispatchConnect(fdi, task); break;
-                    case OpType.Read: ret = dispatchRead(fdi, task); break;
-                    case OpType.Write: ret = dispatchWrite(fdi, task); break;
-                    case OpType.Receive: ret = dispatchRecv(fdi, task); break;
-                    case OpType.Send: ret = dispatchSend(fdi, task); break;
-                    case OpType.Timeout: ret = dispatchTimeout(fdi, task); break;
+                    case OpType.Accept: res = dispatchAccept(fdi, task); break;
+                    case OpType.Connect: res = dispatchConnect(fdi, task); break;
+                    case OpType.Read: res = dispatchRead(fdi, task); break;
+                    case OpType.Write: res = dispatchWrite(fdi, task); break;
+                    case OpType.Receive: res = dispatchRecv(fdi, task); break;
+                    case OpType.Send: res = dispatchSend(fdi, task); break;
+                    case OpType.Timeout: res = dispatchTimeout(fdi, task); break;
                 }
 
-                completeTask(pipeline, taskId, task, ret);
+                if (!res.inProgress) return completeTask(pipeline, taskId, task, res);
+
+                // Postpone the execution until the file descriptor is ready again
+                task.status = Status.Type.Pending;
+                pipeline.status = Pipeline.Status.notReady;
             }(fdi.pipeline(task));
         }
 
@@ -440,7 +534,7 @@ public:
         FDInfo register(int fd)
         {
             selector.add(fd);
-            return FDInfo(fd, Pipeline(Pipeline.State.notReady), Pipeline(Pipeline.State.notReady));
+            return FDInfo(fd, Pipeline(Pipeline.Status.notReady), Pipeline(Pipeline.Status.notReady));
         }
 
         /** 
@@ -450,9 +544,8 @@ public:
         {
             fds.take(fd, (ref FDInfo fdi)
             {
-                // TODO: Remove all tasks chain for the related FDInfo
-                if (fdi.read.head) tasks.remove(fdi.read.head);
-                if (fdi.write.head) tasks.remove(fdi.write.head);
+                foreach (taskId; pipelines.make(fdi.read.state)) cancelTask(taskId);
+                foreach (taskId; pipelines.make(fdi.write.state)) cancelTask(taskId);
 
                 fds.remove(fd);
                 selector.remove(fd);
@@ -466,33 +559,24 @@ public:
         {
             const fd = task.data.fd;
 
-            // Create new FDInfo if doesn't exist and add it to epoll
+            /*
+            When we already have the FDInfo in our list, we just need to insert
+            the task to the pipeline, but we must consider two scenarios:
+
+            1. There are no associated tasks for this descriptor
+            2. There are already some scheduled tasks
+
+            In the first case we need to run the task immediately (if the fd is ready)
+            */
             with (fds.require(fd, register(fd)).pipeline(task))
             {
-                /*
-                * When we already have the FDInfo in our list, we just need to update
-                * pointers for the associated tasks, but we must consider two scenarios:
-                *
-                * 1. There are no associated tasks for this descriptor
-                * 2. There are already some scheduled tasks
-                */
-                if (!head)
+                with (pipelines.make(state))
                 {
-                    head = taskId;
-                    tail = taskId;
+                    put(taskId);
 
-                    // Immediately put the task to the run queue because the file
-                    // descriptor is ready to perform reads or writes
-                    if (state == Pipeline.State.ready || task.isWrite) {
-                        runQueue.put(taskId);
+                    if (length == 1 && (status == Pipeline.Status.ready || task.isWrite)) {
+                        enqueueTask(taskId);
                     }
-                }
-                else
-                {
-                    tasks.take(tail, (ref Task lastTask) {
-                        lastTask.next = taskId;
-                        tail = taskId;
-                    });
                 }
             }
 
@@ -520,24 +604,27 @@ public:
                         fd,
                         (ref FDInfo fdi)
                         {
-                            // BUG: Prevent scheduling the same task multiple times when receiving duplicate events
                             if (ev.events & IN)
                             {
-                                fdi.read.state =
-                                    ev.events & ERR ? Pipeline.State.error :
-                                    ev.events & RDHUP ? Pipeline.State.hup : Pipeline.State.ready;
+                                fdi.read.status =
+                                    ev.events & ERR ? Pipeline.Status.error :
+                                    ev.events & RDHUP ? Pipeline.Status.hup : Pipeline.Status.ready;
 
-                                if (fdi.read.head in tasks) runQueue.put(fdi.read.head);
+                                with (pipelines.make(fdi.read.state)) {
+                                    if (!empty) enqueueTask(front);
+                                }
                             }
 
                             // TODO: Handle partially-completed write operations (and retries in case of EINTR)
                             if (ev.events & OUT)
                             {
-                                fdi.write.state =
-                                    ev.events & ERR ? Pipeline.State.error :
-                                    ev.events & HUP ? Pipeline.State.hup : Pipeline.State.ready;
+                                fdi.write.status =
+                                    ev.events & ERR ? Pipeline.Status.error :
+                                    ev.events & HUP ? Pipeline.Status.hup : Pipeline.Status.ready;
 
-                                if (fdi.write.head in tasks) runQueue.put(fdi.write.head);
+                                with (pipelines.make(fdi.write.state)) {
+                                    if (!empty) enqueueTask(front);
+                                }    
                             }
                         },
                         () => remove(fd)
@@ -559,18 +646,16 @@ public:
             fds = typeof(fds)(initialCapacity);
 
             // Initialize work queues
-            runQueue = typeof(runQueue)(&resolveNode);
-            completionQueue = typeof(completionQueue)(&resolveNode);
+            auto queue = Queue!(Key)(&resolveQueueEntry);
+
+            runQueue = queue.make();
+            completionQueue = queue.make();
+            pipelines = Queue!(Key)(&resolvePipelineEntry);
 
             // Initialize the timers subsystem
             timers = typeof(timers)(tasks.capacity, &resolveTimer);
             clock = typeof(clock).make();
             fds[clock.fd] = register(clock.fd);
-        }
-
-        ~this()
-        {
-            unregister(clock.fd);
         }
 
         alias List(Elem...) = Elem;
@@ -592,10 +677,11 @@ public:
 
         IO submit(Timeout op)
         {
-            auto task = Task();
-            task.type = OpType.Timeout;
-            task.data.fd = clock.fd;
-            task.timer = Timer(op.dur);
+            Task task = {
+                type: OpType.Timeout,
+                data: { fd: clock.fd },
+                timer: Timer(op.dur),
+            };
 
             const taskId = tasks.put(task);
 
@@ -605,24 +691,26 @@ public:
             // we need to re-arm the clock
             fds.take(clock.fd, (scope ref FDInfo fdi)
             {
-                if (fdi.read.head == timers.front) return;
+                with (pipelines.make(fdi.read.state))
+                {
+                    if (front == timers.front) return;
 
-                clock.arm(task.timer);
-                fdi.read.head = timers.front;
+                    reset();
+                    put(timers.front);
+
+                    clock.arm(task.timer);
+                }
             });
 
             return IO(taskId);
         }
 
         /** 
-         * Cancel IO operation
-         *
-         * TODO: Remove cancelled operation from every place and fix the chain pointers
-         */
+        Cancel IO operation
+        */
         bool cancel(IO op)
         {
-            tasks.remove(Key(cast(Key) op));
-            return true;
+            return cancelTask(cast(Key) op);
         }
 
         /** 
@@ -666,8 +754,8 @@ public:
 
                 return tasks.take(
                     taskId,
-                    (ref Task t) const => Event(IO(taskId), t.data.token, Result(t.status.toResultType, t.result)),
-                    () const => Event()
+                    (scope ref Task t) => Event(IO(taskId), t.data.token, t.toResult),
+                    () => Event()
                 );
             }
         }
@@ -742,12 +830,19 @@ version(unittest)
 
     void assertCompletion(IOEngine io, Event[] expected)
     {
+        import std.format : format;
+
         assert(io.length == expected.length);
 
         Comparator[IO] results;
 
-        foreach (const ref ev; expected) {
-            results[ev.op] = ((Event src) => (ref Event dst) => assert(src == dst))(ev);
+        foreach (const ref ev; expected)
+        {
+            results[ev.op] = ((Event src)
+                => (ref Event dst) => assert(
+                    src == dst,
+                    "Invalid completion entry: expected <%s>, got <%s>".format(src, dst)
+                ))(ev);
         }
 
         assertCompletion(io, results);
@@ -979,5 +1074,61 @@ unittest
         assert(remaining2 == 0);
         assertDuration(elapsed2, dur2 - dur1);
         assertCompletion(io, [Event(opTimeout2, Token(), Result(Result.Type.Success, 0))]);
+    }
+}
+
+@("epollCancel")
+unittest
+{
+    import core.time;
+    import core.thread;
+    import std.stdio : stdout;
+
+    ubyte[4] buf;
+    auto fd = (() @trusted => File(stdout.fileno))();
+
+    auto io = new EpollEngine();
+
+    with (io)
+    {
+        () @trusted
+        {
+            const opRead1 = submit(Read(fd, buf));
+            const opRead2 = submit(Read(fd, buf));
+
+            assert(wait() == 2);
+
+            assert(cancel(opRead2));
+            assert(pending == 1);
+            assert(length == 1);
+            assertCompletion(io, [Event(opRead2, Token(), Result(Result.Type.Error, ECANCELED))]);
+
+            assert(cancel(opRead1));
+            assert(length == 1);
+            assert(pending == 0);
+            assertCompletion(io, [Event(opRead1, Token(), Result(Result.Type.Error, ECANCELED))]);
+
+            // Test timeout cancellation
+            const opTime1 = submit(Timeout(1.msecs));
+            const opTime2 = submit(Timeout(2.msecs));
+            const opTime3 = submit(Timeout(1.seconds));
+
+            assert(cancel(opTime1));
+            assert(pending == 2);
+            assert(length == 1);
+            assertCompletion(io, [Event(opTime1, Token(), Result(Result.Type.Error, ECANCELED))]);
+
+            // By this time the 2ms timer opTime2 must be correctly completed
+            Thread.sleep(5.msecs);
+
+            const ret = wait();
+            assert(ret == 1);
+            assert(pending == 1);
+            assert(length == 1);
+            assertCompletion(io, [Event(opTime2, Token(), Result(Result.Type.Success, 0))]);
+
+            assert(cancel(opTime3));
+            assert(pending == 0);
+        }();
     }
 }

@@ -52,6 +52,7 @@ public:
             Pending = 0,
             Success = 1,
             Error = -1,
+            Running = 2,
         }
 
         Type type = Type.Pending;

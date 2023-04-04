@@ -222,90 +222,147 @@ The `Resolver` delegate is required for obtaining data from the storage.
 To be compatible with the queue interface, the storage entry must have the `prev` and `next` fields
 in its body.
 
+The Queue struct acts like a factory which can be instantiated with specific runtime arguments
+and create the queue instances with the shared state on-demand.
+
+It's possible to instantiate a queue using an external state, in which case, the queue instance
+will behave like `refRange()` by mutating the original state.
+
 Time complexity:
-    - Insert: O(1)
-    - Remove: O(1)
+
+    - Insert: $(BIGOH 1)
+    - Remove: $(BIGOH 1)
 */
 public struct Queue(K)
 {
-    alias Resolver = NullableRef!Node delegate (K) @nogc;
+    alias Resolver = NullableRef!Entry delegate (K) @nogc;
+    alias Range = RangeImpl!(Context, State);
+    alias RefRange = RangeImpl!(Context*, State*);
 
-    struct Node
+    public struct Entry
     {
         K prev;
         K next;
     }
 
-    private:
+    public struct State
+    {
         K head;
         K tail;
-        size_t _length;
+        size_t length;
+    }
+
+    private struct Context
+    {
         Resolver resolve;
+    }
+
+    private struct RangeImpl(C, S)
+    {
+        private:
+            immutable C ctx;
+            S state;
+
+        public:
+            @property
+            {
+                size_t length() const { return state.length; }
+                bool empty() const { return !length; }
+                inout(K) front() inout { return state.head; }
+            }
+
+            void put(K entry)
+            {
+                with (ctx.resolve(entry))
+                {
+                    if (isNull) assert(false, "Can't insert a non-existing entry into the Queue");
+
+                    auto tailNode = ctx.resolve(state.tail);
+                    if (!tailNode.isNull) { tailNode.next = entry; }
+                    else { state.head = entry; }
+
+                    prev = state.tail;
+                    next = K.init;
+
+                    state.tail = entry;
+                    state.length++;
+                }
+            }
+
+            void remove(in Entry node)
+            {
+                with (node)
+                {
+                    auto prevNode = ctx.resolve(prev);
+                    if (prevNode.isNull) { state.head = next; }
+                    else { prevNode.next = next; }
+
+                    auto nextNode = ctx.resolve(next);
+                    if (nextNode.isNull) { state.tail = prev; }
+                    else { nextNode.prev = prev; }
+
+                    state.length--;
+                }
+            }
+
+            void popFront()
+            {
+                auto node = ctx.resolve(state.head);
+                if (node.isNull) assert(false, "Can't pop a non-existing entry from the Queue");
+
+                remove(node);
+            }
+
+            void reset()
+            {
+                state.head = K.init;
+                state.tail = K.init;
+                state.length = 0;
+            }
+    }
+
+    private:
+        immutable Context ctx;
 
     public:
         @disable this();
-        @disable this(this);
 
         this(Resolver r)
         {
-            resolve = r;
+            ctx.resolve = r;
         }
 
-        @property
+        /** 
+        The factory method that creates a range around a referenced Queue state.
+        Only used for executing queue operations on multiple queues that share the same
+        context (in this case it's the Resolver delegate). Behaves similarly to `refRange()`.
+
+        This implementation allows to avoid storing a copy of the shared state for each
+        existing queue.
+        */
+        auto make(ref State s)
         {
-            size_t length() const { return _length; }
-            bool empty() const { return !length; }
-            inout(K) front() inout { return head; }
+            return RefRange(&ctx, &s);
         }
 
-        void put(K entry)
+        /** 
+        The factory method that creates a normal range-like object from the original Queue
+        context with zero-initialized sate.
+        */
+        auto make()
         {
-            with (resolve(entry))
-            {
-                if (isNull) assert(false, "Can't insert a non-existing entry into the Queue");
-
-                auto tailNode = resolve(tail);
-                if (!tailNode.isNull) { tailNode.next = entry; }
-                else { head = entry; }
-
-                prev = tail;
-                next = K.init;
-
-                tail = entry;
-                _length++;
-            }
-        }
-
-        void remove(in Node node)
-        {
-            with (node)
-            {
-                auto prevNode = resolve(prev);
-                if (prevNode.isNull) { head = next; }
-                else { prevNode.next = next; }
-
-                auto nextNode = resolve(next);
-                if (nextNode.isNull) { tail = prev; }
-                else { nextNode.prev = prev; }
-
-                _length--;
-            }
-        }
-
-        void popFront()
-        {
-            auto node = resolve(head);
-            if (node.isNull) assert(false, "Can't pop a non-existing entry from the Queue");
-
-            remove(node);
+            return Range(ctx, State());
         }
 }
 
 @("queuePutRemove")
 unittest
 {
+    import std.functional : toDelegate;
+
     alias Key = size_t;
-    alias Node = Queue!(Key).Node;
+    alias Node = Queue!(Key).Entry;
+    alias State = Queue!(Key).State;
 
     struct Entry
     {
@@ -321,8 +378,8 @@ unittest
         return NullableRef!Node(idx <= data.length ? &data[idx].node : null);
     }
 
-    import std.functional : toDelegate;
-    auto q = Queue!(Key)(toDelegate(&resolve));
+    auto queue = Queue!(Key)(toDelegate(&resolve));
+    auto q = queue.make();
 
     assert(q.empty);
     assert(q.length == 0);
@@ -336,8 +393,8 @@ unittest
     assert(!q.empty);
     assert(q.length == 3);
     assert(q.front == 1);
-    assert(q.head == 1);
-    assert(q.tail == 3);
+    assert(q.state.head == 1);
+    assert(q.state.tail == 3);
 
     q.remove(resolve(2));
     with (resolve(1)) assert(prev == 0 && next == 3);
@@ -345,19 +402,33 @@ unittest
     assert(!q.empty);
     assert(q.length == 2);
     assert(q.front == 1);
-    assert(q.head == 1);
-    assert(q.tail == 3);
+    assert(q.state.head == 1);
+    assert(q.state.tail == 3);
 
     q.remove(resolve(1));
     with (resolve(3)) assert(prev == 0 && next == 0);
     assert(!q.empty);
     assert(q.length == 1);
-    assert(q.head == 3);
-    assert(q.tail == 3);
+    assert(q.state.head == 3);
+    assert(q.state.tail == 3);
 
     q.popFront();
     assert(q.empty);
     assert(q.length == 0);
-    assert(q.head == 0);
-    assert(q.tail == 0);
+    assert(q.state.head == 0);
+    assert(q.state.tail == 0);
+
+    // Test external queue state taken by reference (must mutate the original data)
+    auto state = State();
+    auto rq = queue.make(state);
+
+    rq.put(2);
+    assert(state.head == 2);
+    assert(state.tail == 2);
+    assert(state.length == 1);
+
+    rq.put(3);
+    assert(state.head == 2);
+    assert(state.tail == 3);
+    assert(state.length == 2);
 }
