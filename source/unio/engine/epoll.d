@@ -296,7 +296,7 @@ public:
         {
             timers.remove(task.timer);
 
-            with (pipelines.make(fdi.read.state))
+            with (pipelines[fdi.read.state])
             {
                 if (timers.empty || timers.front == front) return;
 
@@ -375,7 +375,7 @@ public:
             task.status = res.type;
             task.result = res.value;
 
-            with (pipelines.make(pipeline.state))
+            with (pipelines[pipeline.state])
             {
                 popFront();
 
@@ -460,7 +460,7 @@ public:
 
             tasks.take(nextId, (scope ref Task next)
             {
-                pipelines.make(fdi.read.state).put(nextId);
+                pipelines[fdi.read.state].put(nextId);
 
                 if (!next.timer.expired)
                 {
@@ -543,8 +543,8 @@ public:
         {
             fds.take(fd, (ref FDInfo fdi)
             {
-                foreach (taskId; pipelines.make(fdi.read.state)) cancelTask(taskId);
-                foreach (taskId; pipelines.make(fdi.write.state)) cancelTask(taskId);
+                foreach (taskId; pipelines[fdi.read.state]) cancelTask(taskId);
+                foreach (taskId; pipelines[fdi.write.state]) cancelTask(taskId);
 
                 fds.remove(fd);
                 selector.remove(fd);
@@ -560,7 +560,7 @@ public:
 
             /*
             When we already have the FDInfo in our list, we just need to insert
-            the task to the pipeline, but we must consider two scenarios:
+            the task into the pipeline, but we must consider two scenarios:
 
             1. There are no associated tasks for this descriptor
             2. There are already some scheduled tasks
@@ -569,7 +569,7 @@ public:
             */
             with (fds.require(fd, register(fd)).pipeline(task))
             {
-                with (pipelines.make(state))
+                with (pipelines[state])
                 {
                     put(taskId);
 
@@ -609,7 +609,7 @@ public:
                                     ev.events & ERR ? Pipeline.Status.error :
                                     ev.events & RDHUP ? Pipeline.Status.hup : Pipeline.Status.ready;
 
-                                with (pipelines.make(fdi.read.state)) {
+                                with (pipelines[fdi.read.state]) {
                                     if (!empty) enqueueTask(front);
                                 }
                             }
@@ -621,7 +621,7 @@ public:
                                     ev.events & ERR ? Pipeline.Status.error :
                                     ev.events & HUP ? Pipeline.Status.hup : Pipeline.Status.ready;
 
-                                with (pipelines.make(fdi.write.state)) {
+                                with (pipelines[fdi.write.state]) {
                                     if (!empty) enqueueTask(front);
                                 }    
                             }
@@ -683,14 +683,13 @@ public:
             };
 
             const taskId = tasks.put(task);
-
             timers.put(taskId);
 
             // If after inserting a new timer, the front timer changes,
             // we need to re-arm the clock
             fds.take(clock.fd, (scope ref FDInfo fdi)
             {
-                with (pipelines.make(fdi.read.state))
+                with (pipelines[fdi.read.state])
                 {
                     if (front == timers.front) return;
 

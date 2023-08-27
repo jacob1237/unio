@@ -345,6 +345,11 @@ public struct Queue(K)
             return RefRange(&ctx, &s);
         }
 
+        ref auto opIndex(ref State s)
+        {
+            return RefRange(&ctx, &s);
+        }
+
         /** 
         The factory method that creates a normal range-like object from the original Queue
         context with zero-initialized sate.
