@@ -47,12 +47,11 @@ import unio;
 
 void main()
 {
-    auto fd = stdout.fileno;
     auto io = new EpollEngine();
 
     with (io) {
-        submit(Write(fd, "Hello "));
-        submit(Write(fd, "World!"));
+        submit(Write(stdout, "Hello "));
+        submit(Write(stdout, "World!\n"));
 
         wait();
     }

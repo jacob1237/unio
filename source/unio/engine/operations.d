@@ -187,8 +187,16 @@ public:
 
     struct Write
     {
+        import std.stdio : StdFile = File;
+
         mixin Operation!File;
         void[] buf;
+
+        this(StdFile file, void[] buf)
+        {
+            fd = File(file.fileno());
+            this.buf = buf;
+        }
 
         this(File file, void[] buf)
         {
