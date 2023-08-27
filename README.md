@@ -8,12 +8,12 @@ The project was started as an attempt to bring clearness, simplicity, flexibilit
 
 ## Goals
 
-1. @safe (when possible), @nogc
+1. `@safe` (when possible), `@nogc`
 2. Fast compilation time
 3. No external dependencies
 4. Easy, but flexible configuration
 5. Asynchronous file IO (via the multi-threaded work queue, when needed)
-6. Unified abstraction over poll, epoll, io_uring, kqueue, IOCP/OverlappedIO
+6. Unified abstraction over `poll`, `epoll`, `io_uring`, `kqueue`, IOCP/OverlappedIO
 
 ## Non-goals
 
