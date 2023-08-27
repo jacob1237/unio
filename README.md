@@ -16,10 +16,11 @@ The project was started as an attempt to bring clearness, simplicity, flexibilit
 
 ## Non-goals
 
-1. Directory watchers, interrupts, signal handling, and other OS-specific features (no bloat!)
-2. Thread pools
-3. Green threads, coroutines, fibers and other program execution models
-4. High level networking and protocols
+1. @safe (when possible), @nogc
+2. Directory watchers, interrupts, signal handling, and other OS-specific features (no bloat!)
+3. Thread pools
+4. Green threads, coroutines, fibers and other program execution models
+5. High level networking and protocols
 
 ## Planned Features
 
