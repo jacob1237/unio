@@ -8,19 +8,19 @@ The project was started as an attempt to bring clearness, simplicity, flexibilit
 
 ## Goals
 
-1. Fast compilation time
-2. No external dependencies
-3. Easy, but flexible configuration
-4. Asynchronous file IO (via the multi-threaded work queue, when needed)
-5. Unified abstraction over poll, epoll, io_uring, kqueue, IOCP/OverlappedIO
+1. @safe (when possible), @nogc
+2. Fast compilation time
+3. No external dependencies
+4. Easy, but flexible configuration
+5. Asynchronous file IO (via the multi-threaded work queue, when needed)
+6. Unified abstraction over poll, epoll, io_uring, kqueue, IOCP/OverlappedIO
 
 ## Non-goals
 
-1. @safe (when possible), @nogc
-2. Directory watchers, interrupts, signal handling, and other OS-specific features (no bloat!)
-3. Thread pools
-4. Green threads, coroutines, fibers and other program execution models
-5. High level networking and protocols
+1. Directory watchers, interrupts, signal handling, and other OS-specific features (no bloat!)
+2. Thread pools
+3. Green threads, coroutines, fibers and other program execution models
+4. High level networking and protocols
 
 ## Planned Features
 
