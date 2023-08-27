@@ -192,6 +192,11 @@ public:
         mixin Operation!File;
         void[] buf;
 
+        this(StdFile file, string buf) @trusted
+        {
+            this(file, cast(void[]) buf);
+        }
+
         this(StdFile file, void[] buf)
         {
             fd = File(file.fileno());

@@ -72,6 +72,7 @@ public:
 
         Type type;
         long value;
+        alias value this;
 
         @property
         {
