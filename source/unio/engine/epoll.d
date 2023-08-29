@@ -347,8 +347,7 @@ public:
                             fds.take(task.data.fd, (scope ref FDInfo fdi) @safe
                             {
                                 if (task.type == OpType.Timeout) cancelTimeout(fdi, task);
-                                else pipelines
-                                    .make(fdi.pipeline(task).state)
+                                else pipelines[fdi.pipeline(task).state]
                                     .remove(task.pipelineEntry);
                             });
 
